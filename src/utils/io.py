@@ -29,8 +29,15 @@ def _stamp(ts: datetime | None = None) -> str:
     return ts.strftime("%Y%m%dT%H%M%SZ")
 
 
-def raw_response_dir(source: str, event_date: date | None = None) -> Path:
-    """Standard layout: data/raw/<source-namespace>/YYYY/MM/DD/."""
+def source_root_dir(source: str) -> Path:
+    """Top-level directory for a source (no date partitioning).
+
+    Layout: data/raw/<namespace>/<rest>/ where namespace is everything before
+    the first underscore (e.g. ``kpx_smp_day_ahead`` → ``kpx/smp_day_ahead``).
+    This is the single source of truth for where a collector's outputs live;
+    downstream code (e.g. the feature builder) should call this helper rather
+    than re-implementing the path scheme.
+    """
     settings = get_settings()
     base = settings.data_dir / "raw"
     if "_" in source:
@@ -38,9 +45,14 @@ def raw_response_dir(source: str, event_date: date | None = None) -> Path:
         sub = Path(ns) / rest
     else:
         sub = Path(source)
+    return base / sub
+
+
+def raw_response_dir(source: str, event_date: date | None = None) -> Path:
+    """Date-partitioned write directory for a source: source_root/YYYY/MM/DD."""
     if event_date is None:
         event_date = date.today()
-    return base / sub / f"{event_date:%Y}" / f"{event_date:%m}" / f"{event_date:%d}"
+    return source_root_dir(source) / f"{event_date:%Y}" / f"{event_date:%m}" / f"{event_date:%d}"
 
 
 def write_raw_payload(

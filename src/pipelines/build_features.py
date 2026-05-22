@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import glob
 from pathlib import Path
 
 import pandas as pd
 import typer
 
+from src.collectors.kpx_smp import KpxSmpCollector
 from src.config.settings import get_settings
 from src.features.build import build_smp_hourly_features
+from src.utils.io import source_root_dir
 from src.utils.logging import get_logger
 from src.validation.leakage_checks import (
     assert_hourly_contiguous,
@@ -20,11 +21,19 @@ from src.validation.leakage_checks import (
 app = typer.Typer(help="Build SMP feature tables.")
 
 
-def _load_collected_smp(raw_root: Path) -> pd.DataFrame:
-    pattern = str(raw_root / "kpx" / "smp" / "**" / "parsed_*.parquet")
-    files = sorted(glob.glob(pattern, recursive=True))
+def _load_collected_smp(source_name: str = KpxSmpCollector.source_name) -> pd.DataFrame:
+    """Read every parsed_*.parquet written by the SMP collector.
+
+    The path is resolved via `source_root_dir(source_name)` so collector and
+    feature builder always agree on the on-disk layout.
+    """
+    root = source_root_dir(source_name)
+    files = sorted(root.rglob("parsed_*.parquet"))
     if not files:
-        raise FileNotFoundError(f"No parsed SMP Parquet files matching {pattern}")
+        raise FileNotFoundError(
+            f"No parsed SMP Parquet files under {root}. "
+            f"Run `python -m src.pipelines.collect_all --source kpx_smp ...` first."
+        )
     frames = [pd.read_parquet(p) for p in files]
     df = pd.concat(frames, ignore_index=True)
     df["interval_end"] = pd.to_datetime(df["interval_end"])
@@ -46,9 +55,7 @@ def main(
     log = get_logger("build_features")
     if target != "smp_hourly":
         raise typer.BadParameter("Only smp_hourly is implemented in this MVP")
-    settings = get_settings()
-
-    smp_df = _load_collected_smp(settings.data_dir / "raw")
+    smp_df = _load_collected_smp()
     log.info("Loaded %d SMP rows across %d areas", len(smp_df), smp_df["area"].nunique())
 
     # The vendor area label may be Korean ('육지'/'제주'). Allow callers to
@@ -74,7 +81,10 @@ def main(
     features = build_smp_hourly_features(filtered, forecast_horizon_hours=horizon)
     log.info("Feature rows=%d cols=%d", len(features), len(features.columns))
 
-    output_path = output_path or settings.data_dir / "processed" / f"{target}_{area}_h{horizon}.parquet"
+    output_path = (
+        output_path
+        or get_settings().data_dir / "processed" / f"{target}_{area}_h{horizon}.parquet"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features.to_parquet(output_path, index=False)
     log.info("Wrote features -> %s", output_path)

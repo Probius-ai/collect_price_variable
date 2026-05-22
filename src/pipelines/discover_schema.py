@@ -65,7 +65,7 @@ def main(
         suffix=fetch.raw_suffix,
         collected_at=collected_at,
     )
-    summary = collector.discover_schema.__wrapped__(collector, **extra) if False else {  # noqa: E501
+    summary = {
         "request": fetch.request,
         "raw_excerpt": fetch.raw_text[:2000],
         "discovered_keys": _summarize(fetch.parsed),

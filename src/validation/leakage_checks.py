@@ -91,11 +91,18 @@ def daily_missing_hour_report(
     timestamp_col: str = "interval_end",
     group_col: str | None = "area",
 ) -> pd.DataFrame:
-    """Return per-day counts vs expected 24 hours."""
+    """Return per-trade-date counts vs expected 24 hours.
+
+    KPX uses interval-end timestamps with trade_hour ∈ 1..24. Hour 24 of
+    trade_date D has interval_end = D+1 00:00. We group by the trade-date by
+    shifting interval_end back by 1 hour before extracting the calendar date.
+    """
     df = df.copy()
     df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-    df["_date"] = df[timestamp_col].dt.date
-    group_cols = [group_col, "_date"] if group_col and group_col in df.columns else ["_date"]
+    df["_trade_date"] = (df[timestamp_col] - pd.Timedelta(hours=1)).dt.date
+    group_cols = (
+        [group_col, "_trade_date"] if group_col and group_col in df.columns else ["_trade_date"]
+    )
     counts = df.groupby(group_cols).size().rename("hour_count").reset_index()
     counts["missing_hours"] = 24 - counts["hour_count"]
-    return counts
+    return counts.rename(columns={"_trade_date": "trade_date"})
