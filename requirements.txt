@@ -1,0 +1,23 @@
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+lightgbm>=4.3
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0
+PyYAML>=6.0
+requests>=2.31
+duckdb>=0.10
+holidays>=0.45
+tenacity>=8.2
+typer>=0.12
+rich>=13.7
+xmltodict>=0.13
+pytest>=8.1
+pytest-cov>=5.0
+
+# Optional / used opportunistically. Comment in if needed.
+# polars>=0.20
+# psycopg[binary]>=3.1
+# xgboost>=2.0
+# statsmodels>=0.14
