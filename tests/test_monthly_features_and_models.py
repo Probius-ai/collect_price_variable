@@ -257,7 +257,7 @@ def test_revision_dedup_prefers_newer_collected_at(tmp_path, monkeypatch):
     )
     assert selected["source_file_sha256"] == "b" * 64
     assert "v2" in selected["source_file"]
-    assert selected["collected_at"] == pd.Timestamp("2026-05-01T09:30:00")
+    assert selected["collected_at"] == pd.Timestamp("2026-05-01T09:30:00", tz="UTC")
 
     log = long.attrs["_priority_dedup_log"]
     sel_rows = log[(log["area"] == "mainland") & (log["role"] == "selected")]
@@ -269,5 +269,85 @@ def test_revision_dedup_prefers_newer_collected_at(tmp_path, monkeypatch):
         "The older value must be recorded as the dropped candidate"
     )
     assert drop_rows.iloc[0]["source_file_sha256"] == "a" * 64
-    assert drop_rows.iloc[0]["collected_at"] == pd.Timestamp("2026-04-01T12:00:00")
+    assert drop_rows.iloc[0]["collected_at"] == pd.Timestamp("2026-04-01T12:00:00", tz="UTC")
     assert drop_rows.iloc[0]["reason"] == "older_revision"
+
+
+def test_revision_dedup_uses_sub_second_precision(tmp_path, monkeypatch):
+    """Same-second different-microsecond snapshots must still be ranked correctly.
+
+    Regression for the second Codex adversarial-review finding: the original
+    fix divided collected_at by 10**9, truncating to seconds. Two snapshots
+    collected in the same second would tie on the rank and fall through to the
+    sha256/parsed_path lexicographic tie-breaker — which could silently keep
+    an older revision if its hash happened to sort first.
+
+    This test arranges hash/path tie-breakers to point at the OLDER row, so
+    only full sub-second precision can produce the correct answer.
+    """
+    from src.utils import io as io_mod
+    import importlib
+
+    class _Stub:
+        data_dir = tmp_path / "data"
+    monkeypatch.setattr(io_mod, "get_settings", lambda: _Stub())
+    bm = importlib.reload(importlib.import_module("src.features.build_monthly"))
+
+    # Same second, different microseconds.
+    older_ts = pd.Timestamp("2026-05-23T16:37:50.000091Z")
+    newer_ts = pd.Timestamp("2026-05-23T16:37:50.500091Z")
+    assert older_ts.floor("s") == newer_ts.floor("s"), (
+        "Sanity: timestamps must share the same second"
+    )
+    assert older_ts < newer_ts
+
+    older = pd.DataFrame({
+        "period_month": [pd.Timestamp("2025-01-01")],
+        "area": ["mainland"],
+        "smp_krw_per_kwh": [100.0],            # value A — older revision
+        "source_id": "kpx_smp_monthly_kepco_file",
+        "collected_at": older_ts,
+        "source_file": "older.csv",
+        "source_file_sha256": "a" * 64,        # lexicographically SMALLEST
+        "source_priority": 1,
+    })
+    newer = older.copy()
+    newer["smp_krw_per_kwh"] = [123.45]        # value B — newer revision
+    newer["collected_at"] = newer_ts
+    newer["source_file"] = "newer.csv"
+    newer["source_file_sha256"] = "z" * 64     # lexicographically LARGEST →
+                                               # would lose on sha-ascending
+                                               # if the timestamps tied.
+
+    root = bm.source_root_dir("kpx_smp_monthly_kepco_file")
+    d_older = root / "2025" / "01" / "01"
+    d_newer = root / "2025" / "01" / "02"
+    d_older.mkdir(parents=True, exist_ok=True)
+    d_newer.mkdir(parents=True, exist_ok=True)
+    # Parquet filenames also arranged so path-ascending tie-break would prefer
+    # the OLDER row (aaaa < zzzz). Only correct sub-second precision picks
+    # the newer row.
+    older.to_parquet(d_older / "parsed_aaaa.parquet", index=False)
+    newer.to_parquet(d_newer / "parsed_zzzz.parquet", index=False)
+
+    long = bm.load_smp_monthly_long()
+    row = long[
+        (long["period_month"] == pd.Timestamp("2025-01-01"))
+        & (long["area"] == "mainland")
+    ]
+    assert len(row) == 1
+    selected = row.iloc[0]
+    assert selected["smp_krw_per_kwh"] == 123.45, (
+        "Newer microsecond timestamp must win even when sha/path tie-breakers "
+        "would otherwise pick the older row."
+    )
+    assert selected["source_file_sha256"] == "z" * 64
+    assert selected["collected_at"] == newer_ts
+
+    log = long.attrs["_priority_dedup_log"]
+    dropped = log[(log["area"] == "mainland") & (log["role"] == "dropped")]
+    assert len(dropped) == 1
+    assert dropped.iloc[0]["smp_krw_per_kwh"] == 100.0
+    assert dropped.iloc[0]["source_file_sha256"] == "a" * 64
+    assert dropped.iloc[0]["collected_at"] == older_ts
+    assert dropped.iloc[0]["reason"] == "older_revision"

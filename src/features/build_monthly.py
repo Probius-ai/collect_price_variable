@@ -226,18 +226,27 @@ def load_smp_monthly_long(sources: list[str] | None = None) -> pd.DataFrame:
         )
     long = pd.concat(frames, ignore_index=True)
     long["period_month"] = pd.to_datetime(long["period_month"])
-    long["collected_at"] = pd.to_datetime(long["collected_at"], errors="coerce")
+    # Normalise collected_at to UTC so tz-naive (legacy) and tz-aware (new)
+    # snapshots can be ranked on the same axis. utc=True interprets tz-naive
+    # values as UTC and converts tz-aware values to UTC.
+    long["collected_at"] = pd.to_datetime(
+        long["collected_at"], utc=True, errors="coerce"
+    )
     long["source_priority"] = long["source_priority"].astype("int64")
     long["source_file_sha256"] = long["source_file_sha256"].fillna("").astype(str)
     long["parsed_path"] = long["parsed_path"].astype(str)
 
-    # Multi-key sort. NB: pandas treats NaT as "smallest" by default, which
-    # would let a snapshot with a missing collected_at beat real revisions.
-    # We materialise a sortable rank that pushes NaT to the bottom (oldest).
-    epoch_seconds = (
-        long["collected_at"].astype("int64") // 10**9
-    ).where(long["collected_at"].notna(), other=np.int64(np.iinfo(np.int64).min))
-    long["_collected_at_rank"] = epoch_seconds
+    # Build the collected_at rank at FULL native precision (microseconds in
+    # pandas ≥ 3 by default, nanoseconds in older pandas). Do NOT divide to
+    # seconds: same-second-different-microsecond snapshots must still be
+    # distinguishable, otherwise the lexicographic sha/path tie-breaker would
+    # silently keep an older revision that happens to come first by hash.
+    # NaT is forced to int64.min so missing collected_at sorts LAST under
+    # descending-by-rank ordering (older / unknown timing always loses).
+    collected_int = long["collected_at"].astype("int64")
+    long["_collected_at_rank"] = collected_int.where(
+        long["collected_at"].notna(), other=np.iinfo(np.int64).min
+    )
     long_sorted = long.sort_values(
         by=[
             "period_month",
