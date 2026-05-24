@@ -77,12 +77,36 @@ def load_sources_config() -> dict[str, Any]:
 
 
 def get_source_config(source_name: str) -> dict[str, Any]:
-    """Return the per-source config block, raising if the source is unknown."""
+    """Return the per-source config block, raising if the source is unknown.
+
+    Searches `sources:` (API collectors) first, then `file_sources:`
+    (manual-download file loaders) so callers can use one helper for both.
+    """
     config = load_sources_config()
-    sources = config.get("sources", {})
-    if source_name not in sources:
-        raise KeyError(f"Unknown source '{source_name}'. Known: {sorted(sources)}")
-    return sources[source_name]
+    api_sources = config.get("sources", {}) or {}
+    file_sources = config.get("file_sources", {}) or {}
+    if source_name in api_sources:
+        return api_sources[source_name]
+    if source_name in file_sources:
+        return file_sources[source_name]
+    raise KeyError(
+        f"Unknown source '{source_name}'. Known API sources: {sorted(api_sources)}; "
+        f"known file sources: {sorted(file_sources)}"
+    )
+
+
+def get_source_kind(source_name: str) -> str:
+    """Return 'api' or 'file' for a source."""
+    config = load_sources_config()
+    if source_name in (config.get("sources") or {}):
+        return "api"
+    if source_name in (config.get("file_sources") or {}):
+        return "file"
+    raise KeyError(f"Unknown source '{source_name}'.")
+
+
+def list_file_sources() -> list[str]:
+    return sorted((load_sources_config().get("file_sources") or {}).keys())
 
 
 def get_source_defaults() -> dict[str, Any]:

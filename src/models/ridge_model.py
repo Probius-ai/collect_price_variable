@@ -9,7 +9,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-DEFAULT_RIDGE_FEATURES = [
+DEFAULT_RIDGE_FEATURES_HOURLY = [
     "demand_forecast_mw",
     "demand_lag_24h",
     "demand_lag_168h",
@@ -24,6 +24,30 @@ DEFAULT_RIDGE_FEATURES = [
     "dow_cos",
     "month",
 ]
+
+DEFAULT_RIDGE_FEATURES_MONTHLY = [
+    "smp_lag_1m",
+    "smp_lag_2m",
+    "smp_lag_3m",
+    "smp_lag_6m",
+    "smp_lag_12m",
+    "smp_rolling_3m_mean",
+    "smp_rolling_6m_mean",
+    "smp_rolling_12m_mean",
+    "smp_rolling_12m_std",
+    "month_sin",
+    "month_cos",
+    "quarter",
+    # Settlement (wide-by-fuel, lag_1m) — added when settlement monthly is loaded.
+    "settlement_unit_price_total_lag_1m",
+    "settlement_unit_price_nuclear_lag_1m",
+    "settlement_unit_price_coal_total_lag_1m",
+    "settlement_unit_price_lng_lag_1m",
+    "settlement_unit_price_renewable_lag_1m",
+]
+
+# Kept for backward-compat
+DEFAULT_RIDGE_FEATURES = DEFAULT_RIDGE_FEATURES_HOURLY
 
 
 class RidgeModel:
@@ -41,7 +65,10 @@ class RidgeModel:
             if missing:
                 raise KeyError(f"Ridge: missing requested features {missing}")
             return list(self.feature_cols)
-        return [c for c in DEFAULT_RIDGE_FEATURES if c in X.columns]
+        # Auto-detect granularity: prefer monthly defaults when monthly lags exist.
+        if any(c.endswith("_lag_1m") or c.endswith("_lag_12m") for c in X.columns):
+            return [c for c in DEFAULT_RIDGE_FEATURES_MONTHLY if c in X.columns]
+        return [c for c in DEFAULT_RIDGE_FEATURES_HOURLY if c in X.columns]
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> "RidgeModel":
         self.used_features = self._select_features(X)

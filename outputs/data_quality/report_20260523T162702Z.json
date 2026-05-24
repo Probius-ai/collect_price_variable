@@ -1,0 +1,120 @@
+{
+  "generated_at": "2026-05-23T16:27:02.418993+00:00",
+  "sources": {
+    "kpx_rec_weekly_file": {
+      "runs": 1,
+      "latest_collected_at": "2026-05-23 16:26:37.765903",
+      "latest_source_file": "/home/probius/collect_price_variable/data/raw/manual_or_filedata/kpx_rec_weekly_file/한국전력거래소_주간 신재생에너지 인증서(REC) 거래현황_20230330.csv",
+      "source_url": "https://www.data.go.kr/data/15094820/fileData.do",
+      "frequency": "weekly_file_trading_day",
+      "unit": null,
+      "schema_version": 1,
+      "dropped_columns": [],
+      "missing_canonical_categories": [],
+      "limitations": [
+        "파일명은 '주간'이지만 row 단위는 trading_day (장 운영일). 비거래일은 row가 없음.",
+        "단가 단위는 KRW/REC. 체결총액 단위는 KRW (백만원 아님 — vendor 헤더 기준).",
+        "DST/timezone 영향 없음 (한국 표준시 거래일자)."
+      ],
+      "rows": 601,
+      "trade_date_min": "2017-03-28",
+      "trade_date_max": "2023-03-30"
+    },
+    "kpx_settlement_monthly_file": {
+      "runs": 1,
+      "latest_collected_at": "2026-05-23 16:26:37.323448",
+      "latest_source_file": "/home/probius/collect_price_variable/data/raw/manual_or_filedata/kpx_settlement_monthly_file/HOME_전력거래_정산단가_연료원별.csv",
+      "source_url": "https://epsis.kpx.or.kr/epsisnew/selectEkmaUpsBftChart.do",
+      "frequency": "monthly",
+      "unit": "KRW/kWh",
+      "schema_version": 1,
+      "dropped_columns": [
+        "신재생_바이오",
+        "신재생_석탄가스화",
+        "신재생_수력",
+        "신재생_연료전지",
+        "신재생_태양",
+        "신재생_폐기물",
+        "신재생_풍력",
+        "신재생_해양"
+      ],
+      "missing_canonical_categories": [],
+      "limitations": [
+        "EPSIS 정산단가는 수정정산으로 변동될 수 있음 (M+1 published, ~연 1회 확정).",
+        "정산단가 산정 시 RPS 의무이행비용정산금 + 배출권거래비용정산금은 제외 (EPSIS 공식 설명).",
+        "Renewable subcategories (신재생_연료전지/태양/풍력/...) are dropped — only 신재생_계 carried as 'renewable'."
+      ],
+      "rows": 2842,
+      "period_min": "2002-01-01",
+      "period_max": "2026-04-01",
+      "rows_by_fuel_type": {
+        "coal_anthracite": 292,
+        "coal_bituminous": 292,
+        "coal_total": 292,
+        "lng": 292,
+        "nuclear": 292,
+        "oil": 292,
+        "other": 214,
+        "pumped_storage": 292,
+        "renewable": 292,
+        "total": 292
+      }
+    },
+    "kpx_smp_monthly_home_avg_file": {
+      "runs": 1,
+      "latest_collected_at": "2026-05-23 16:26:36.818353",
+      "latest_source_file": "/home/probius/collect_price_variable/data/raw/manual_or_filedata/kpx_smp_monthly_home_avg_file/HOME_전력거래_계통한계가격_가중평균SMP.xlsx",
+      "source_url": "https://epsis.kpx.or.kr/epsisnew/selectEkmaSmpShdChart.do",
+      "frequency": "monthly",
+      "unit": "KRW/kWh",
+      "schema_version": 1,
+      "dropped_columns": [],
+      "missing_canonical_categories": [],
+      "limitations": [
+        "Multi-row header; loader flattens via forward-fill + 'level0|level1'.",
+        "BLMP column captured but not used by SMP feature pipeline yet.",
+        "Same logical data as kpx_smp_monthly_kepco_file; priority 2 (fallback)."
+      ],
+      "rows": 903,
+      "period_min": "2001-04-01",
+      "period_max": "2026-04-01",
+      "rows_by_area": {
+        "integrated": 301,
+        "jeju": 301,
+        "mainland": 301
+      }
+    },
+    "kpx_smp_monthly_kepco_file": {
+      "runs": 1,
+      "latest_collected_at": "2026-05-23 16:26:36.390602",
+      "latest_source_file": "/home/probius/collect_price_variable/data/raw/manual_or_filedata/kpx_smp_monthly_kepco_file/한국전력거래소_육지 제주 통합 월별 계통한계가격_20250831.csv",
+      "source_url": "https://www.data.go.kr/data/15043266/fileData.do",
+      "frequency": "monthly",
+      "unit": "KRW/kWh",
+      "schema_version": 1,
+      "dropped_columns": [],
+      "missing_canonical_categories": [],
+      "limitations": [
+        "Manually downloaded snapshot — track collected_at; KPX may revise.",
+        "Single file carries 3 areas wide; loader melts to long format."
+      ],
+      "rows": 381,
+      "period_min": "2015-02-01",
+      "period_max": "2025-08-01",
+      "rows_by_area": {
+        "integrated": 127,
+        "jeju": 127,
+        "mainland": 127
+      }
+    },
+    "kpx_smp_yearly": {
+      "runs": 0,
+      "rows": 0
+    }
+  },
+  "quarantine": [],
+  "notes": [
+    "kpx_settlement_monthly_file: dropped vendor columns (renewable subcategories etc): 신재생_바이오, 신재생_석탄가스화, 신재생_수력, 신재생_연료전지, 신재생_태양, 신재생_폐기물, 신재생_풍력, 신재생_해양",
+    "kpx_smp_yearly: no parsed rows on disk yet."
+  ]
+}

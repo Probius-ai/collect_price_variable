@@ -1,0 +1,659 @@
+% !TEX program = xelatex
+% Overleaf 컴파일러: XeLaTeX (메뉴 → Menu → Compiler → XeLaTeX)
+% 한글 폰트는 kotex의 기본(Noto Serif KR 등)을 사용한다.
+% 그림이 필요한 경우 figures/ 디렉터리에 png/pdf 파일을 추가하고
+% \includegraphics{...} 블록의 주석을 해제하면 된다.
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{kotex}
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{amsmath,amssymb}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tabularx}
+\usepackage{makecell}
+\usepackage{enumitem}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue!60!black
+}
+
+\sisetup{group-separator={,}, group-minimum-digits=4, detect-weight=true}
+
+\renewcommand{\arraystretch}{1.15}
+
+\title{
+  한국 전력시장 월별 SMP 예측에서의 \\
+  단순 모델 우위와 구조적 단절: \\
+  데이터 희소·체제 전환 환경에서의 발견과 시사점
+}
+
+\author{
+  익명 저자\thanks{교신 저자. 본 논문의 실험 코드와 데이터 파이프라인은
+  내부 저장소 \texttt{kpx-price-forecast}에 공개되어 있다.}\\
+  \small 한국 전력시장 가격예측 모듈 연구
+}
+
+\date{2026년 5월}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+본 연구는 한국 전력거래소(KPX)와 EPSIS가 공개하는 월별
+계통한계가격(SMP), 정산단가, 그리고 신재생에너지 공급인증서(REC)
+거래자료를 통합한 자체 ETL·예측 파이프라인을 구축하고,
+2011년 1월부터 2026년 3월까지의 174개월 자료를 대상으로
+\textit{Naive}(lag\,1m), \textit{Seasonal Naive}(lag\,12m),
+\textit{Ridge}, \textit{LightGBM} 네 가지 모델을 비교하였다.
+연구의 주된 기여는 모델 자체의 정확도 경신이 아니라,
+\textbf{한국 전력시장의 구조적 특성이 시계열 예측 결과에 어떤
+형태로 나타나는지}를 실증적으로 보여주는 데 있다.
+
+분석 결과 다섯 가지 새로운 발견이 도출되었다.
+첫째, 월별 단위에서는 단순 lag\,1m이 평균절대오차(MAE)
+\SI{9.40}{KRW\per kWh}로 LightGBM(\SI{16.05}{}),
+Ridge(\SI{14.93}{}), Seasonal Naive(\SI{22.20}{})을 모두 능가했다.
+둘째, 2022--2023년 LNG 가격 충격으로 검증 구간의 SMP 90백분위가
+\SI{246.89}{KRW\per kWh}까지 치솟은 반면 시험 구간은
+\SI{133.43}{}로 회귀하여, 한국 SMP에 명확한
+\textit{구조적 단절}이 관측되었다.
+셋째, 동일 월에 대해 육지 SMP가 \SI{89.29}{}일 때 제주 SMP는
+\SI{140.34}{KRW\per kWh}로 약 57\,\% 높게 형성되어,
+HVDC 연계와 출력제한 제약 하에서 제주를 별도 시장으로 다뤄야 함이
+정량적으로 확인되었다.
+넷째, KPX 공식 파일에서 ``0.00''이 결측 표기자로 사용되거나
+파일명-내용 불일치가 발견되어, 공공 시계열 자료를 그대로
+사용하면 침묵된 데이터 품질 위험에 노출됨이 드러났다.
+다섯째, EPSIS 정산단가가 RPS 의무이행비용·배출권 비용을
+제외하도록 정의되어 있어, SMP와 정산단가를 단일 ``가격''으로 비교하는
+관행이 한국 시장에서는 정의상 부적절함을 확인하였다.
+이러한 발견들은 단일구매자(KEPCO) 구조,
+비용기반 입찰(CBP), 정부 요금규제, 분리된 제주계통, RPS 의무할당제로
+특징지어지는 한국 전력시장의 제도적 맥락에서 해석된다.
+
+\noindent\textbf{핵심어:} SMP, 한국 전력시장, KPX, 시계열 예측,
+체제 전환, 정산단가, REC, 데이터 품질, LightGBM, Ridge.
+\end{abstract}
+
+\section{서론}
+\label{sec:intro}
+
+한국 도매전력시장은 1999년 전력산업 구조개편 이후 한국전력거래소(KPX)가
+운영하는 \textit{비용기반 풀(Cost-Based Pool, CBP)} 구조를 유지하고 있다.
+KPX는 매일 23시경 익일의 시간대별 \textit{계통한계가격}(System Marginal
+Price, SMP)을 공시하며, 발전사업자는 이 가격을 기준으로
+한국전력공사(KEPCO)와 정산한다. SMP는 24개의 시간대별 한계가격이
+하루 단위로 발표되고\footnote{공공데이터포털 ``한국전력거래소\_계통한계가격 및
+수요예측(하루전 발전계획용)'' API 공식 설명에 따른다.},
+일반 이용자는 별도 정산 과정을 거친 \textit{정산단가}와
+신재생 의무이행을 위한 \textit{REC} 거래 결과를 추가로 관측하게 된다.
+
+본 연구는 KPX·EPSIS 공식 자료를 일관된 ETL 계층으로 수집·정제하여
+월간 단위의 SMP 예측 파이프라인을 구축하고, 한국 시장 고유의
+제도 변수가 예측 결과에 어떻게 투영되는지를 분석한다. 본 논문은
+대용량 신경망 도입 이전 단계에서 ``무엇을 발견했는가''를 정직하게
+보고하는 데 목적이 있으며, 이를 통해 후속 연구가 동일한 함정을
+반복하지 않도록 하는 것을 목표로 한다.
+
+\paragraph{기여 요약.}
+\begin{enumerate}[leftmargin=1.6em]
+  \item 한국 전력시장의 ``API 승인 지연''이라는 행정적 제약 아래에서도
+        먼저 동작 가능한 \emph{파일 기반 사전승인 MVP}와, API 승인 이후
+        시간 단위로 확장 가능한 동일 스키마의 \emph{API 백엔드}를
+        병행 구축하였다.
+  \item 174개월 자료에 대해 4가지 베이스라인을 비교한 결과,
+        단순 lag\,1m이 정형 ML을 압도함을 정량적으로 보였다.
+  \item 2022--2023년 LNG 충격이 학습 분포를 어떻게 깨뜨리는지,
+        그리고 그것이 ``과적합'' 형태로 ML 모델에 어떤 흔적을 남기는지를
+        분리·시험·검증 구간 통계로 추적하였다.
+  \item 제주 SMP와 육지 SMP의 정량적 괴리를 동일 시점에서 직접
+        대비하여, 양 시장을 분리 모델링해야 함을 데이터로 입증하였다.
+  \item 공공 시계열 파일에 내재한 ``0.00 결측 표기'', ``파일명-내용 불일치''
+        등 데이터 품질 위험을 검역(quarantine) 기반으로 처리하는 방법을
+        제시하였다.
+\end{enumerate}
+
+\section{한국 전력시장의 제도적 맥락}
+\label{sec:context}
+
+다음의 다섯 가지 제도적 특징이 SMP 시계열의 통계적 성질을 결정한다.
+실증 결과(\S\ref{sec:findings})의 해석은 모두 이 맥락에 기반한다.
+
+\begin{description}[leftmargin=1.4em,style=nextline]
+  \item[(C1) 단일구매자(KEPCO) 구조]
+        모든 발전사업자가 KPX 시장에 입찰하지만, 최종적으로 전력을
+        구매하는 주체는 KEPCO로 일원화되어 있다. 이는 가격을 결정하는
+        시장 참여자 수가 사실상 1인이라는 의미이며, 소매단가가
+        SMP의 변동을 자유롭게 흡수하지 못한다.
+  \item[(C2) 비용기반 입찰(CBP)]
+        SMP는 발전사업자가 신고한 변동비를 바탕으로 결정되는
+        한계비용 가격이다. 따라서 SMP는 ``시장이 결정한 가격''이라기보다는
+        ``한계 연료(통상 LNG)의 원가''에 거의 비례한다.
+  \item[(C3) 분리된 제주계통]
+        제주는 육지와 HVDC로 연결되어 있으나, 운영상 별도의 SMP가
+        공시되며 자체 출력제한이 빈번하다. 따라서 ``전국 SMP''라는
+        단일 통계량은 가격 발견의 단위로 사용되기 어렵다.
+  \item[(C4) RPS와 REC 제도]
+        2012년부터 시행된 신재생에너지 의무할당제(RPS)에 따라
+        500\,MW 이상의 발전사업자는 의무비율의 신재생 전력을 자가발전
+        또는 REC 매입으로 충당해야 한다. 이는 SMP와는 별도의
+        \textit{보조 가격 신호}로 작동한다.
+  \item[(C5) 정산단가와 SMP의 정의적 분리]
+        EPSIS 공식 정의에 따르면 정산단가는 ``RPS 의무이행비용정산금''과
+        ``배출권거래비용정산금''을 제외하고 산정된다. 따라서
+        SMP, 정산단가, 소매요금은 \emph{서로 다른 정의 영역}을 가진
+        가격 계열이며, 단일 차원에서 비교하는 것은 정의상 부적절하다.
+\end{description}
+
+\section{데이터와 방법}
+\label{sec:method}
+
+\subsection{데이터 출처와 정제}
+
+본 연구에서 사용한 자료는 모두 공공 출처(KPX, EPSIS, data.go.kr)에서
+2026년 5월 기준으로 내려받았다. 표 \ref{tab:sources}에 자료별 빈도,
+단위, 행 수를 요약하였다.
+
+\begin{table}[h]
+\centering
+\caption{사용 데이터셋 요약(2026년 5월 기준)}
+\label{tab:sources}
+\small
+\begin{tabularx}{\linewidth}{l l l c X}
+\toprule
+\textbf{자료원} & \textbf{빈도} & \textbf{단위} & \textbf{행 수} & \textbf{특이사항} \\
+\midrule
+KPX 월별 SMP (KEPCO 파일)            & 월   & KRW/kWh   & 378  & 2015-02 -- 2025-08, 육지/제주/통합. \\
+KPX 월별 SMP (EPSIS HOME 가중평균)   & 월   & KRW/kWh   & 693  & 2001-04 -- 2026-04, 다중헤더. \\
+EPSIS 연료원별 정산단가               & 월   & KRW/kWh   & 2842 & 2002-01 -- 2026-04, 수정정산 가능. \\
+KPX 주간 REC 거래현황                 & 거래일 & KRW/REC   & 601  & 2017-03 -- 2023-03, 비거래일 없음. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{이중 우선순위 병합}
+
+동일 (월, 지역)에 대해 두 SMP 파일이 모두 값을 제공할 수 있어,
+KEPCO 파일(2015-02--2025-08)을 우선순위 1, EPSIS HOME
+파일(2001-04--2026-04)을 우선순위 2로 두는 이중 병합 규칙을
+적용했다. 따라서 학습 구간 전반부(2011-01--2015-01)와
+최신 구간(2025-09--2026-03)은 HOME 파일을 사용하고, 두 출처가
+겹치는 2015-02--2025-08 구간은 KEPCO 우선이다. 병합 과정에서
+두 출처가 같은 값을 보고한 쌍은 다수였지만, 일부 (예: 2015년 4월
+육지) 출처 간 \SI{75.37}{} vs \SI{103.45}{}와 같은 의미 있는 차이가
+발견되어 \texttt{smp\_priority\_dedup\_log}로 영구 보존하였다.
+
+\subsection{특성 공학과 누출 차단}
+
+월별 특성으로 SMP의 lag (1, 2, 3, 6, 12개월), 이동평균(3, 6, 12개월),
+이동표준편차(12개월), 캘린더 변수(연/월/분기/계절), 사인-코사인
+인코딩, 그리고 EPSIS 정산단가 10종(LNG, 원자력, 무연탄,
+유연탄, 석탄합계, 유류, 양수, 신재생, 기타, 합계)을 lag 1개월로
+결합하였다.
+모든 lag/rolling은 \emph{타깃 시점 직전}까지의 정보만 사용하도록
+강제하며, 특성 컬럼이 타깃 컬럼과 정확히 동일해지는 사고를
+탐지하는 ``leakage canary'' 검사를 통과시켰다.
+
+\subsection{모델과 분할}
+
+네 모델을 비교하였다.
+(M1) \texttt{naive\_lag\_1m}: $\hat{y}_t = y_{t-1}$.
+(M2) \texttt{seasonal\_naive\_lag\_12m}: $\hat{y}_t = y_{t-12}$.
+(M3) Ridge: $L_2$ 정규화 선형회귀 + StandardScaler.
+(M4) LightGBM: gradient boosting tree (기본 하이퍼파라미터,
+\texttt{min\_data\_in\_leaf}는 데이터 희소성을 고려하여 일부 조정).
+분할은 무작위가 아닌 시계열 순(시간 순)이며, \texttt{train.py}의
+기본값(\texttt{valid\_frac=0.15}, \texttt{test\_frac=0.15})을
+적용하였다. 그 결과 총 174개월 중
+\textbf{학습 122개월(2011-01\,--\,2021-11)},
+\textbf{검증 26개월(2021-12\,--\,2024-01)},
+\textbf{시험 26개월(2024-02\,--\,2026-03)}로 분할되었다. 이 경계는
+검증 구간이 2022--2023년 LNG 충격기를 \emph{전부 포함}하도록 자연스럽게
+형성된다는 점에서 본 연구 결과 해석에 결정적이다.
+
+\section{새로운 발견}
+\label{sec:findings}
+
+본 절은 본 논문의 핵심 기여이다. 다섯 가지 발견(F1--F5)을 차례로
+제시하며, 각 발견을 \S\ref{sec:context}의 제도적 맥락
+(C1)--(C5)과 명시적으로 연결한다.
+
+\subsection{발견 F1: 단순 모델이 정형 ML을 압도한다}
+\label{sec:f1}
+
+육지(mainland) SMP 1개월 선행 예측 결과는 표 \ref{tab:metrics}에
+요약된다. 시험 구간 MAE 기준으로 단순 \texttt{naive\_lag\_1m}이
+\SI{9.40}{KRW\per kWh}로 가장 우수하며, Ridge(\SI{14.93}{}),
+LightGBM(\SI{16.05}{}), Seasonal Naive(\SI{22.20}{})를 모두 능가한다.
+방향성(directional accuracy)에서는 Seasonal Naive(0.60)가 가장 우수하나,
+수준(level) 예측에서는 일관되게 \texttt{lag\,1m}이 최선이었다.
+
+\begin{table}[h]
+\centering
+\caption{육지 월별 SMP 1개월 선행 예측: 모델 비교 (시험 구간, $n=26$)}
+\label{tab:metrics}
+\small
+\begin{tabular}{l S[table-format=2.2] S[table-format=2.2] S[table-format=2.2] S[table-format=1.2] S[table-format=-1.2]}
+\toprule
+\textbf{모델} & {\textbf{MAE}} & {\textbf{RMSE}} & {\textbf{MAPE\,[\%]}} & {\textbf{방향성}} & {\textbf{$R^2$}} \\
+\midrule
+naive\_lag\_1m         & 9.40  & 12.01 & 8.21  & 0.48 & 0.06  \\
+ridge                  & 14.93 & 17.30 & 12.63 & 0.44 & -0.94 \\
+lightgbm               & 16.05 & 18.83 & 13.01 & 0.08 & -1.30 \\
+seasonal\_naive\_lag\_12m & 22.20 & 34.24 & 18.69 & 0.60 & -6.61 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+이 결과는 ``더 복잡한 모델이 더 좋다''는 기본 가정을 부정한다.
+그러나 본 연구는 \emph{왜} 그렇게 되었는지에 대해 두 개의
+구분되는 메커니즘을 분리해 보고한다.
+
+\paragraph{(i) Ridge의 경우 --- 위상 오차와 약한 회귀평균 편향에 의한
+음(-)의 $R^2$.}
+Ridge는 \texttt{ridge\_model.py::DEFAULT\_RIDGE\_FEATURES\_MONTHLY}를
+통해 월별 특성 17개(\texttt{smp\_lag\_\{1,2,3,6,12\}m},
+\texttt{smp\_rolling\_\{3,6,12\}m\_*}, \texttt{month\_sin/cos},
+\texttt{quarter}, 그리고 5종의 정산단가 lag\,1m)를 \emph{자동} 사용한다.
+학습 구간(2011-01\,--\,2021-11)은 LNG 충격을 \textbf{포함하지 않으며},
+시험 구간(2024-02\,--\,2026-03)은 검증 구간에 발생한 충격의 잔여 효과로
+LNG 정산단가가 \SI{180}{}--\SI{200}{KRW\per kWh} 수준에 머무는 반면
+SMP 자체는 \SI{90}{}--\SI{145}{}로 정상화된 ``디커플링'' 체제이다.
+
+이러한 학습/시험 분포 차이가 음의 $R^2$\,(\,$-0.94$)를 낳은 메커니즘을,
+본 연구는 \texttt{outputs/models/ridge/predictions\_test.csv}의
+실제 예측값을 직접 합산하여 다음과 같이 분해한다(표 \ref{tab:ridge_diag}).
+
+\begin{table}[h]
+\centering
+\caption{Ridge 시험 구간 예측 진단(육지, $n=26$,
+\texttt{predictions\_test.csv} 기반)}
+\label{tab:ridge_diag}
+\small
+\begin{tabular}{l S}
+\toprule
+\textbf{지표} & {\textbf{값}} \\
+\midrule
+시험 구간 실제 SMP 평균 (KRW/kWh)            & 118.04 \\
+시험 구간 Ridge 예측 평균 (KRW/kWh)            & 110.31 \\
+평균 잔차 \(\bar{e} = \overline{\hat{y}-y}\) (KRW/kWh) & -7.72 \\
+저예측 시점 수 (\(\hat{y}<y\))                  & 19 \\
+과대예측 시점 수 (\(\hat{y}>y\))                 & 7  \\
+최대 저예측 (2024-07: $y$=145.79, $\hat{y}$=109.76) & -36.03 \\
+최대 과대예측 (2024-10: $y$=112.26, $\hat{y}$=135.83) & +23.57 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+세 가지 사실이 도출된다.
+\textbf{(a)} 시험 구간 26개월 중 19개월에서 Ridge는 \emph{저예측}하며
+평균 잔차는 $-7.72$\,KRW/kWh이다. 따라서 본 논문의 이전 가설인
+``LNG 정산단가↑ 학습 → 시험에서 체계적 과대예측''은 데이터로 기각된다.
+\textbf{(b)} 실제로 관측되는 것은 \emph{회귀평균(regression-to-mean)
+방향의 약한 음의 편향}이다. 시험 구간 실제 평균(118.04)이 학습 구간
+평균(약 \SI{99}{}--\SI{105}{}, EPSIS 가중평균 기준)보다 높으므로,
+$L_2$ 정규화로 인해 시험 분포 평균까지 끌어올리지 못한다.
+\textbf{(c)} 더 큰 기여는 \emph{위상 오차}이다. Ridge는
+2024-07 정점(\SI{145.79}{})을 \SI{109.76}{}로 \SI{36.03}{KRW\per kWh}만큼
+저예측하고, 직후 2024-10 저점(\SI{112.26}{})은 \SI{135.83}{}로
+\SI{23.57}{} 과대예측한다. 즉 Ridge는 시험 구간 SMP의 \emph{수준은}
+대체로 따라가지만, \emph{변동 시점}을 1\,--\,2개월씩 어긋나게 잡는다.
+시험 구간 SMP의 분산이 작기 때문에 ($\mathrm{SS}_{\mathrm{tot}}$ 작음)
+이러한 위상 오차는 $\mathrm{SS}_{\mathrm{res}}/\mathrm{SS}_{\mathrm{tot}}>1$을
+초래하여 $R^2<0$로 나타난다.
+
+요약하면, Ridge가 단순 lag\,1m을 이기지 못한 원인은
+``편향된 외삽''이 아니라 \emph{회귀평균 방향의 약한 편향과 위상 오차의
+결합}이며, 이는 충격 이후의 디커플링 체제에서 \emph{고정된 선형 결합}이
+근본적으로 추적하기 어려운 동학을 갖는다는 사실에 기인한다.
+
+\paragraph{(ii) LightGBM의 경우 --- 설정 부재로 인한 \textit{de facto}
+3-특성 모델.} \texttt{lightgbm\_model.py::DEFAULT\_LGB\_FEATURES}는
+시간별(hourly) 특성 목록(\texttt{smp\_lag\_24h} 등)으로 정의되어 있어,
+월별 입력에서는 교집합이 \texttt{month}, \texttt{is\_summer},
+\texttt{is\_winter}의 3개에 불과하다. 실제로 본 실험의
+\texttt{feature\_importance.csv}는 정확히 이 3개 행만 보고하며,
+\texttt{is\_summer}와 \texttt{is\_winter}의 importance는 둘 다 0이다.
+즉 LightGBM은 사실상 \emph{``month'' 한 변수만 받은 결정트리}로
+학습된 것이며, 본 연구의 LightGBM 성능 저하는 ``모델의 무능''이
+아니라 \textbf{월별 디폴트 특성 목록의 부재}라는 도구 측 문제이다.
+이는 본 연구가 부산물로 발견한 \textit{재현성 함정}이기도 하며
+(코드 저장소에 본 사항을 별도 이슈로 기록함), 후속 연구는
+\texttt{feature\_cols}를 명시적으로 전달해야 한다.
+
+\paragraph{(C1)·(C2)와의 연결.}
+한국 SMP가 ``한계 연료 단가''의 결정론적 함수(C2)에 가깝다면,
+\emph{직전월의 SMP}는 이미 그 한계 연료비를 거의 다 반영하고 있다.
+ML이 추가로 발견할 ``숨겨진 비선형''의 여지가 좁다는 의미이며,
+이는 단일구매자 구조(C1)가 시장 참가자 간 전략적 상호작용에 의한
+가격의 ``노이즈''를 억제하는 결과로 해석할 수 있다. Ridge가
+17개 특성을 받고도 naive를 이기지 못한 사실은 이 해석을 보강한다.
+
+\subsection{발견 F2: LNG 충격에 의한 구조적 단절}
+\label{sec:f2}
+
+학습/검증/시험 구간의 SMP 90백분위는 각각
+\SI{150.17}{}, \SI{246.89}{}, \SI{133.43}{KRW\per kWh}였다.
+이는 검증 구간(2021-12 -- 2024-01, LNG 충격 정점을 포함)이
+다른 두 구간 대비 \textit{40--80\,\%} 상승한 분포를 가졌음을 의미한다.
+표 \ref{tab:regime}은 이 분포 이동이 모델 성능에 끼친 영향을
+세 구간 모두에 대해 보고한다.
+
+\begin{table}[h]
+\centering
+\caption{구간별 MAE의 분포 이동 효과(KRW/kWh, 90백분위 기준)}
+\label{tab:regime}
+\small
+\begin{tabular}{l S S S S}
+\toprule
+\textbf{모델} & {\textbf{Train MAE}} & {\textbf{Valid MAE}} & {\textbf{Test MAE}} & {\textbf{Valid Peak 90\%}} \\
+\midrule
+naive\_lag\_1m   & 10.08 & 30.71 & 9.40  & 246.89 \\
+ridge            & 8.10  & 28.35 & 14.93 & 246.89 \\
+seasonal\_naive\_12m & 21.53 & 88.07 & 22.20 & 246.89 \\
+lightgbm         & 28.08 & 73.43 & 16.05 & 246.89 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+특히 Seasonal Naive의 검증 MAE \SI{88.07}{}는 ``12개월 전을 그대로
+사용하는'' 가정이 LNG 충격기에 완전히 무너졌음을 보여준다.
+2022년 같은 달의 SMP는 평시의 거의 두 배에 달해, 1년 후의 가격을
+예측하는 데 활용할 수 없는 ``이상치''로 작동한 것이다.
+
+\paragraph{(C2)·(C4)와의 연결.}
+SMP가 한계 LNG 가격을 거의 그대로 반영(C2)하는 한국 시장의 특성상,
+국제 LNG 시장의 외생적 충격은 곧바로 한국 SMP의 \emph{분포 자체}를
+이동시킨다. 이는 RPS 정책(C4)이 일정 부분 가격 시그널을 분산시키지만,
+SMP 자체의 LNG 노출은 여전히 크다는 점을 시사한다. 따라서
+시계열 예측의 ``train/test split''은 단순한 시간 순 분할만으로는
+부족하며, \emph{회귀 체제(regime)} 식별과 함께 진행되어야 한다.
+
+\subsection{발견 F3: 육지-제주 SMP의 항상적 괴리}
+\label{sec:f3}
+
+표 \ref{tab:jeju}에서 동일 시점의 육지/제주 SMP를 직접 비교했다.
+2017--2018년의 데이터는 제주가 육지 대비
+\textbf{평균 약 50\,\%} 더 높은 가격으로 형성되어 있음을 보여준다.
+
+\begin{table}[h]
+\centering
+\caption{동일 월 육지-제주 SMP 직접 비교(KRW/kWh, KEPCO 우선순위 자료)}
+\label{tab:jeju}
+\small
+\begin{tabular}{l S S S}
+\toprule
+\textbf{월}       & {\textbf{육지}} & {\textbf{제주}} & {\textbf{괴리율}} \\
+\midrule
+2017-08           & 75.91  & 120.67 & +58.9\% \\
+2018-01           & 91.80  & 133.46 & +45.4\% \\
+2018-03           & 101.15 & 131.77 & +30.3\% \\
+2018-06           & 89.29  & 140.34 & +57.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{(C3)과의 연결.}
+제주는 자체 발전믹스(상대적으로 비싼 중유·LNG 비중과 풍력·태양광
+출력제한)와 HVDC 연계 제약(C3)으로 육지와는 다른 한계비용 곡선을
+가진다. 따라서 ``육지+제주''를 평균한 단일 SMP 시계열은
+시장 구조와 일치하지 않는 통계량이다. 본 연구에서는 \texttt{mainland},
+\texttt{jeju}, \texttt{integrated}를 별도 영역(area)으로 두고
+세 개의 독립 특성 테이블을 생성하였다.
+
+\subsection{발견 F4: 공공 자료의 침묵된 데이터 품질 위험}
+\label{sec:f4}
+
+데이터 품질 보고서에서 다음 두 가지 침묵된 위험이 발견되었다.
+
+\begin{enumerate}[leftmargin=1.6em,label=(\arabic*)]
+  \item \textbf{``0.00'' 결측 표기:} EPSIS HOME 가중평균 SMP 파일에서
+        \texttt{jeju} 105행, \texttt{mainland} 105행이
+        ``0.00''으로 기재되어 있었으며, 이는 ``발표되지 않음''을
+        의미하는 사실상의 결측 표기였다. 만약 그대로 사용했더라면
+        SMP가 0\,KRW/kWh로 잘못 학습되어, 트리 모델의
+        분기 기준을 심각하게 왜곡했을 것이다. 본 연구는 이를
+        \texttt{zero\_coerced\_rows}로 기록하고 NaN으로 강제 변환
+        후 행을 제거하였다.
+  \item \textbf{파일명-내용 불일치:} ``HOME\_전력거래\_계통한계가격\_
+        가중평균SMP.csv''라는 파일명을 갖지만 내부 컬럼은
+        ``연도, 수력, 기력, 복합화력, 원자력, 신재생, \ldots''인
+        \emph{연료원별 발전량} 파일이 검역되었다. 이는 사용자가
+        파일명만 보고 SMP 로더로 처리할 경우, 발전량(MWh)을
+        가격(KRW/kWh)으로 오인하는 침묵된 오류로 이어진다.
+        본 파이프라인은 컬럼 시그니처 기반 검역으로 이를 차단했다.
+\end{enumerate}
+
+\paragraph{시사점.}
+한국 공공데이터 생태계는 신뢰도가 비교적 높은 편이나,
+\emph{메타데이터(file header)와 콘텐츠(file body)의 불일치}는
+조용히 누적되는 위험이다. SMP·정산단가·REC와 같이 정책적으로
+민감한 지표일수록 ``보이는 결측''보다 ``숨겨진 0''이 더 위험하다.
+
+\subsection{발견 F5: SMP, 정산단가, 소매요금은 정의 영역이 다르다}
+\label{sec:f5}
+
+EPSIS 정산단가 자료의 공식 한계 설명은 다음과 같다.
+``정산단가 산정 시 RPS 의무이행비용정산금 및 배출권거래비용정산금은
+제외된다.'' 즉, SMP는 ``한계 연료의 도매 가격'',
+정산단가는 ``RPS·배출권 비용을 빼고 정산된 평균 단가'',
+소매요금은 ``규제된 KEPCO 판매가격''으로, 셋은 서로 다른
+정의 도메인을 갖는다.
+
+본 연구의 정산단가 10종(LNG, 원자력, 무연탄, 유연탄, 석탄합계,
+유류, 양수, 신재생, 기타, 합계)에 대한 EDA에서, 직전월 LNG
+정산단가가 당월 SMP를 \textbf{일관되게 상회}하는 패턴이 관측되었다
+(표 \ref{tab:settlement}). 본 표는 예측 시점에 가용한 가장 최신
+정산단가가 ``직전월(t$-$1) 발표분''이라는 점을 그대로 반영하므로,
+\emph{타깃 시점(t)의 SMP}와 \emph{타깃 시점에 관측 가능한 LNG
+정산단가(t$-$1)}를 직접 대비한다. 이 격차는 RPS 의무이행비용
+정산금과 배출권 비용이 정산단가 정의에서 제외(C5)된 결과로
+해석된다.
+
+\begin{table}[h]
+\centering
+\caption{당월 SMP(t) vs. 직전월 LNG 정산단가(t$-$1) 비교 예시
+(육지, KRW/kWh; 출처: \texttt{smp\_monthly\_mainland\_h1m.parquet}의
+\texttt{smp\_krw\_per\_kwh}와 \texttt{settlement\_unit\_price\_lng\_lag\_1m}
+컬럼)}
+\label{tab:settlement}
+\small
+\begin{tabular}{l S S S}
+\toprule
+\textbf{기준월(t)} & {\textbf{SMP$_t$}} & {\textbf{LNG 정산단가$_{t-1}$}} & {\textbf{차이}} \\
+\midrule
+2024-01            & 137.91 & 184.06 & +46.15 \\
+2024-08            & 145.79 & 181.54 & +35.75 \\
+2025-12            & 90.43  & 135.73 & +45.30 \\
+2026-03            & 110.03 & 152.31 & +42.28 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{(C5)와의 연결.}
+정산단가가 SMP보다 평균 \SI{35}{}--\SI{46}{KRW\per kWh}
+높게 형성되는 것은 RPS·배출권 비용이 정산단가에서 제외된 정의(C5)
+하에서 비용 회수가 ``SMP + 별도 청구''의 형태로 분산되어 있기
+때문이다. 따라서 ``SMP만 예측하면 발전사업자의 매출을
+예측할 수 있다''는 직관은 한국 시장에서는 부정확하며,
+\emph{SMP, 정산단가, REC, 정책 변수}를 함께 모델링해야 한다.
+
+\section{시사점}
+\label{sec:implications}
+
+\subsection{모델링 관점}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{단순 베이스라인의 비대칭적 강건성.} 데이터 희소(monthly)
+        체제에서는 ML이 ``과적합 + 분포 이동 민감''의 형태로 실패한다.
+        Naive lag\,1m은 적어도 ``직전월의 가격''이라는 명확한
+        시장 메커니즘과 일치하므로, 표본이 작을수록 우위가
+        커진다.
+  \item \textbf{체제 인식형 분할의 필요.} train/test split이 단순
+        시간 순서만으로는 \S\ref{sec:f2}의 LNG 충격 같은 외생적
+        체제 단절을 처리할 수 없다. ``평시/충격기/회복기''의
+        세 체제를 명시적으로 분리하거나, \texttt{regime indicator}를
+        특성에 포함시키는 방향이 권장된다.
+  \item \textbf{지역 분리.} ``전국 SMP''라는 변수는 한국 시장에서는
+        의미 있는 단위가 아니다(\S\ref{sec:f3}). 모든 후속 연구는
+        \texttt{mainland}, \texttt{jeju}, \texttt{integrated}를
+        독립 변수로 분리해야 한다.
+\end{itemize}
+
+\subsection{시장 설계 관점}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{단일구매자 구조와 가격 노이즈.} 단순 lag 모델이 압도적인
+        성능을 보이는 사실은, 한국 SMP가 ``경쟁시장의 변동성''이라기보다
+        ``비용 회수의 결정론적 함수''에 가깝다는 사실(C1)을 정량적으로
+        뒷받침한다. 시장 설계자가 \emph{경쟁적 가격 발견}을 의도한다면,
+        이 결정론성은 정책 목표에 대한 신호일 수 있다.
+  \item \textbf{LNG 의존성의 위험 회피.} 검증 구간의 분포 이동(\S\ref{sec:f2})은
+        SMP 자체가 위험 자산처럼 행동했다는 의미이다. 발전사업자
+        측에서는 ``SMP 헷지(SMP hedging)'' 메커니즘에 대한 수요가
+        커질 것이며, 정책 측에서는 한계 연료 다변화의 시급성이
+        시계열 통계로도 확인된다.
+\end{itemize}
+
+\subsection{데이터 거버넌스 관점}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{0 = 결측 가능성.} 공공 시계열을 사용하는 모든 후속
+        연구는 ``0''을 진짜 값으로 간주하기 전, 자료의 발표 정책
+        문서를 참조해야 한다(\S\ref{sec:f4}).
+  \item \textbf{컬럼 시그니처 기반 검역.} 파일명만으로 자료의 의미를
+        결정하지 말고, 컬럼 헤더 시그니처를 기준으로 라우팅하는
+        ETL 패턴이 필요하다.
+  \item \textbf{스냅샷 보존.} 정산단가는 ``수정정산'' 가능성이 있으므로
+        \texttt{collected\_at} 단위 스냅샷 보존은 선택이 아니라 필수다.
+\end{itemize}
+
+\section{한계와 후속 연구}
+\label{sec:limits}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{시간 단위 예측 부재.} 본 연구는 API 승인 지연으로 인해
+        월별 단위에 한정되어 수행되었다. 시간 단위로 확장하면
+        ``수요 예측'', ``발전믹스 5분 단위'', ``연료원별 SMP 결정 횟수''
+        등의 변수가 합류하여, 동일 모델 비교가 다른 결론을 낼
+        가능성이 있다.
+  \item \textbf{기상·연료비 API 미접속.} 기상청 ASOS와 한국은행 ECOS
+        환율 자료는 본 연구에 직접 포함되지 못했다. 이들은 LNG 충격기의
+        ``외생 변수''로 작용했을 가능성이 매우 높다.
+  \item \textbf{REC 예측 모델 부재.} 현재 REC 자료는 특성(lag)으로만
+        사용되며 별도 예측 타깃이 아니다. RPS 정책 충격이 REC 가격에
+        주는 영향은 SMP에 대한 영향과 정책적 함의가 다를 수 있다.
+\end{itemize}
+
+\section{결론}
+\label{sec:conclusion}
+
+본 연구는 한국 전력시장 월별 SMP 예측을 통해, ``모델의 정교함보다
+시장의 정의를 먼저 이해해야 한다''는 단순한 명제를 정량적으로
+재확인하였다. 단일구매자 구조, 비용기반 입찰, 분리된 제주계통,
+RPS·배출권 제도, 정산단가의 정의적 분리라는 한국 시장의 다섯 가지
+제도적 특성은 모두 \emph{관측된 시계열의 통계적 성질}로 환원되며,
+이를 무시한 채 ML을 적용하면 의도하지 않은 형태의
+실패(과적합, 분포 이동 민감, 침묵된 데이터 오류)에 직면한다.
+
+본 연구가 제시한 다섯 가지 발견 --- 단순 모델의 우위, LNG 충격에
+의한 구조적 단절, 육지-제주 괴리, 0 결측의 위험, SMP·정산단가의
+정의적 분리 --- 는 모두 한국 전력시장 고유의 제도와 직접
+연결되어 있다. 이러한 의미에서 본 연구는 ``한국 전력시장
+가격예측은 일반적 시계열 예측 문제가 아니라, \emph{제도적
+맥락을 코드로 반영한 도메인 모델링 문제}''라는 입장을 제시한다.
+
+\section*{재현성 자료}
+
+본 논문의 모든 수치, 표, 모델은 다음 명령으로 재현 가능하다.
+주의: 출력 parquet의 시간 컬럼명은 \texttt{period\_month}이다
+(저장소 README의 \texttt{TS=year\_month} 예시는 오타이며, 실제
+파이프라인은 \texttt{period\_month}만 인식한다).
+
+\begin{verbatim}
+# 1) 파일 로더 (KEPCO 우선, EPSIS HOME fallback)
+python -m src.pipelines.load_files --source kpx_smp_monthly_mainland
+python -m src.pipelines.load_files --source kpx_smp_monthly_jeju
+python -m src.pipelines.load_files --source kpx_smp_monthly_integrated
+python -m src.pipelines.load_files --source kpx_settlement_monthly_file
+python -m src.pipelines.load_files --source kpx_rec_weekly_file
+
+# 2) 월별 특성 테이블 생성 (육지, T+1개월)
+python -m src.pipelines.build_monthly_features \
+       --area mainland --horizon-months 1
+
+# 3) 네 가지 베이스라인 학습 (시계열 순 분할, valid/test = 15%/15%)
+F=data/processed/smp_monthly_mainland_h1m.parquet
+Y=target_smp_t_plus_h_months
+TS=period_month
+for M in naive_lag_1m seasonal_naive_lag_12m ridge lightgbm; do
+  python -m src.pipelines.train --features-path $F --model $M \
+         --target $Y --timestamp-col $TS --min-train-rows 24
+done
+
+# 4) 모델 간 비교표 생성 (outputs/metrics/comparison.csv)
+python -m src.pipelines.evaluate
+\end{verbatim}
+
+표 \ref{tab:metrics}와 \ref{tab:regime}의 모든 수치는
+\texttt{outputs/metrics/comparison.csv}에서 직접 참조 가능하며,
+LightGBM의 특성중요도는 \texttt{outputs/models/lightgbm/feature\_importance.csv}에
+저장된다. 데이터 품질 이슈(\S\ref{sec:f4})는
+\texttt{outputs/data\_quality/report\_*.json}에서 확인할 수 있다.
+
+\section*{감사의 글}
+
+본 연구의 데이터 파이프라인은 한국전력거래소(KPX), 전력통계정보
+시스템(EPSIS), 공공데이터포털(data.go.kr)의 공개 자료에 의존한다.
+모든 출처의 원자료 발표·운영 기관에 감사를 표한다.
+
+\begin{thebibliography}{9}
+
+\bibitem{kpx_smp}
+한국전력거래소, ``계통한계가격 및 수요예측(하루전 발전계획용),''
+공공데이터포털, \url{https://www.data.go.kr}, 최종확인 2026-05.
+
+\bibitem{epsis_settlement}
+한국전력거래소 전력통계정보시스템(EPSIS), ``연료원별 정산단가,''
+\url{https://epsis.kpx.or.kr}, 최종확인 2026-05.
+
+\bibitem{kpx_smp_monthly}
+한국전력거래소, ``육지/제주/통합 월별 계통한계가격,''
+data.go.kr 파일데이터셋 \texttt{15043266}, 최종확인 2026-05.
+
+\bibitem{kpx_rec_weekly}
+한국전력거래소, ``주간 신재생에너지 인증서(REC) 거래현황,''
+data.go.kr 파일데이터셋 \texttt{15094820}, 최종확인 2026-05.
+
+\bibitem{kma_asos}
+기상청 기상자료개방포털, ``ASOS 종관기상관측자료,''
+\url{https://data.kma.go.kr}, 최종확인 2026-05.
+
+\bibitem{kpx_rules}
+한국전력거래소, ``전력시장운영규칙 제2장 제4절 가격결정,''
+시장운영규칙 시행본, 최종확인 2026-05.
+
+\bibitem{lightgbm}
+G.~Ke et~al., ``LightGBM: A Highly Efficient Gradient Boosting Decision
+Tree,'' \emph{NeurIPS}, 2017.
+
+\bibitem{rps_law}
+산업통상자원부, ``신에너지 및 재생에너지 개발·이용·보급 촉진법''
+및 시행령, RPS 의무할당 비율 고시.
+
+\end{thebibliography}
+
+\end{document}

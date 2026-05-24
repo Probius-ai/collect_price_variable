@@ -1383,3 +1383,84 @@ Evaluation:
 - spike recall
 
 정산단가와 REC는 SMP 파이프라인이 안정화된 뒤 확장한다. 이 순서가 데이터 수집 난이도, 모델 검증 가능성, 메인 프로젝트 연동성을 모두 고려했을 때 가장 안정적이다.
+
+## Pre-Approval Data Strategy
+
+Some KPX Open APIs may remain under approval review. Until API access is granted, the project will use public file datasets and EPSIS downloadable statistics to build a monthly forecasting MVP.
+
+### Pre-Approval Targets
+
+- Monthly mainland SMP
+- Monthly Jeju SMP
+- Monthly integrated SMP
+- Monthly settlement unit price
+- Monthly REC spot/contract average price
+
+### Pre-Approval Data Sources
+
+1. Korea Power Exchange monthly mainland/Jeju/integrated SMP file dataset
+2. Korea Power Exchange yearly SMP file dataset for EDA
+3. EPSIS weighted average SMP statistics
+4. EPSIS generation by source statistics
+5. Korea Power Exchange monthly settlement unit price file dataset
+6. Korea Power Exchange monthly REC transaction data
+7. Korea Power Exchange weekly REC transaction data
+
+### Pre-Approval Modeling Scope
+
+The MVP model will operate at monthly frequency.
+
+Initial models:
+- Naive lag-1 month
+- Seasonal naive lag-12 months
+- Ridge regression
+- LightGBM
+
+### Migration After API Approval
+
+Once KPX Open APIs are approved, the project will extend from monthly prediction to hourly/daily prediction.
+
+Migration priority:
+1. Replace monthly SMP target with hourly SMP from the day-ahead SMP and demand forecast API.
+2. Add 5-minute generation by source data and aggregate it to hourly features.
+3. Add daily SMP decision count by fuel as lagged features.
+4. Add monthly fuel cost API as lagged exogenous variables.
+5. Keep monthly settlement and REC models as separate downstream modules.
+
+## Snapshot Idempotency and Revision Policy
+
+### Snapshot Naming
+
+All raw, parsed, and metadata outputs must use collision-proof names.
+
+Required components:
+- microsecond-resolution UTC timestamp
+- source file stem
+- source file SHA-256 hash prefix
+- load run ID
+
+The loader must never silently overwrite an existing snapshot. If an output path already exists, the loader must raise `FileExistsError`.
+
+### Revision Selection Policy
+
+Multiple parsed snapshots may exist for the same logical observation.
+
+For monthly SMP, the canonical record is selected by:
+
+1. `period_month` ascending
+2. `area` ascending
+3. `source_priority` ascending
+4. `collected_at` descending
+5. `source_file_sha256` ascending
+6. `parsed_path` ascending
+
+Deduplication key:
+- `period_month`
+- `area`
+
+Within the same source priority, the latest `collected_at` wins.
+
+Every dropped duplicate must be recorded in a revision report with:
+- selected snapshot metadata
+- dropped snapshot metadata
+- drop reason

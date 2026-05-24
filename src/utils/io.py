@@ -29,6 +29,17 @@ def _stamp(ts: datetime | None = None) -> str:
     return ts.strftime("%Y%m%dT%H%M%SZ")
 
 
+def manual_drop_dir(source: str) -> Path:
+    """Where the user drops a downloaded CSV/XLSX for a file source.
+
+    Layout: ``data/raw/manual_or_filedata/<source_name>/``.
+    The loader auto-copies the file into the date-partitioned raw layout when
+    it parses it, so the drop directory acts as an inbox.
+    """
+    settings = get_settings()
+    return settings.data_dir / "raw" / "manual_or_filedata" / source
+
+
 def source_root_dir(source: str) -> Path:
     """Top-level directory for a source (no date partitioning).
 

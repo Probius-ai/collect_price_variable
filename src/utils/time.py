@@ -9,7 +9,7 @@ trade_date + 1 day. We normalize everything to a single timezone-naive
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
@@ -58,4 +58,4 @@ def assert_no_duplicate_timestamps(timestamps: Iterable, label: str = "timestamp
 
 def collected_now_utc() -> datetime:
     """Naive UTC `now` used for `collected_at` columns."""
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)

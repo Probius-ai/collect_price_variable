@@ -1,229 +1,447 @@
-# Source-specific assumptions for KPX / KMA / ECOS datasets.
-# IMPORTANT:
-#   - Field names listed here are only the API request/response keys we have
-#     *observed* on a real response. Anything not yet verified is marked
-#     `TBD_AFTER_FIRST_RESPONSE`. Do NOT invent field names.
-#   - When you confirm a field name from a live response, update both
-#     `verified_columns` and `column_mapping` and bump `schema_version`.
-
 defaults:
-  timezone: Asia/Seoul
-  request_timeout_seconds: 30
+  rate_limit_per_minute: 50
   request_retry_attempts: 5
   request_retry_backoff_seconds: 2
-  rate_limit_per_minute: 50
-
-sources:
-
-  # ---------------------------------------------------------------------------
-  # P0-1 — KPX SMP + 수요예측 (하루전 발전계획용)
-  # 공공데이터포털: 한국전력거래소_계통한계가격 및 수요예측(하루전 발전계획용)
-  # ---------------------------------------------------------------------------
-  kpx_smp_day_ahead:
-    official_name: "한국전력거래소_계통한계가격 및 수요예측(하루전 발전계획용)"
-    description: |
-      Hourly system marginal price (SMP) and demand forecast for mainland and
-      Jeju. Updated once per day around 23:00. Each trade hour represents the
-      interval ending at that hour.
-    expected_frequency: hourly
-    expected_regions: ["육지", "제주"]
-    # Update endpoint once confirmed from the public-data portal page.
-    base_url: "TBD_AFTER_FIRST_RESPONSE"
-    operation: "TBD_AFTER_FIRST_RESPONSE"
-    response_format: "json"  # request `type=json` if the API supports it
+  request_timeout_seconds: 30
+  timezone: Asia/Seoul
+file_sources:
+  kpx_generation_yearly:
+    candidate_source_id: kpx_generation_yearly
+    encoding: cp949
+    file_format: csv
+    filename_globs_misnamed:
+    - HOME_전력거래_계통한계가격_가중평균SMP.csv
+    - HOME_전력거래_계통한계가격_가중평균SMP (2).csv
+    frequency: yearly
+    header_rows:
+    - 0
+    - 1
+    last_verified_at: null
+    limitations:
+    - DO NOT load via SMP loader — content is generation MWh by fuel source, not SMP
+      price.
+    - Filename says 'SMP' but actual columns are 연도, 수력, 기력, 복합화력, 원자력, 신재생, ...
+    - 'Quarantined this round: no loader implemented yet.'
+    - Confirm unit (MWh vs MW·month) before building feature joins.
+    official_name: 한국전력거래소 연도별 발전원별 발전량 (파일명은 'SMP'로 잘못 표기됨)
+    reason: filename_content_mismatch
     schema_version: 0
-    # Request parameter names commonly required by data.go.kr KPX APIs.
-    # These are typical but unconfirmed; run schema discovery before trusting.
-    request_params:
-      service_key: "serviceKey"
-      page_no: "pageNo"
-      num_of_rows: "numOfRows"
-      type: "type"
-      # Date params are TBD; the SMP day-ahead API may use baseDate or trDay.
-      base_date_param: "TBD_AFTER_FIRST_RESPONSE"
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
-    # Map vendor column name -> internal canonical name.
-    # Populate after `python -m src.pipelines.discover_schema --source kpx_smp_day_ahead`.
+    source_id: kpx_generation_yearly
+    source_url: TBD_AFTER_FIRST_DOWNLOAD
+    status: pending_schema_verification
+    unit: MWh (suspected — verify)
+  kpx_rec_monthly_file:
     column_mapping:
-      area: TBD_AFTER_FIRST_RESPONSE
-      trade_date: TBD_AFTER_FIRST_RESPONSE
-      trade_hour: TBD_AFTER_FIRST_RESPONSE
-      smp_krw_per_kwh: TBD_AFTER_FIRST_RESPONSE
-      demand_forecast_mw: TBD_AFTER_FIRST_RESPONSE
-    interval_convention: end  # trade_hour=6 ⇒ 05:00–06:00, timestamp = 06:00
+      contract_amount_million_krw: TBD_AFTER_FIRST_DOWNLOAD
+      contract_volume_rec: TBD_AFTER_FIRST_DOWNLOAD
+      spot_amount_million_krw: TBD_AFTER_FIRST_DOWNLOAD
+      spot_volume_rec: TBD_AFTER_FIRST_DOWNLOAD
+      year_month: TBD_AFTER_FIRST_DOWNLOAD
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: TBD_AFTER_FIRST_DOWNLOAD
+    file_format: TBD_AFTER_FIRST_DOWNLOAD
+    frequency: monthly
+    header_row: 0
+    header_rows: null
+    last_verified_at: null
+    limitations:
+    - REC monthly summary loader skipped this round — yearly-summary xlsx files require
+      dedicated handling.
+    official_name: 한국전력거래소 신재생에너지 공급인증서(REC) 월간 거래현황
+    schema_version: 0
+    sheet_name: null
+    source_id: kpx_rec_monthly_file
+    source_priority: 1
+    source_url: TBD_AFTER_FIRST_DOWNLOAD
+    status: deferred_to_next_round
     units:
-      smp: "KRW/kWh"
-      demand_forecast: "TBD_AFTER_FIRST_RESPONSE"  # verify MW vs MWh
-    source_fact_checked: true
-    last_verified_at: null
-
-  # ---------------------------------------------------------------------------
-  # P1 — 연료원별 SMP 결정 횟수 (일별)
-  # ---------------------------------------------------------------------------
-  kpx_smp_decision_by_fuel:
-    official_name: "한국전력거래소_연료원별 SMP 결정 횟수(일별)"
-    description: |
-      Daily count by fuel type (LNG, oil, bituminous coal, anthracite,
-      nuclear) of how often each fuel set the SMP. From 2024-08-20 mainland
-      and Jeju are reported separately and the endpoint changed to
-      `SmpDecByFuel2/getSmpDecByFuel2` with an `areaNm` field.
-    schema_pre_2024_08_20:
-      endpoint: "TBD_AFTER_FIRST_RESPONSE"
-      areaNm_present: false
-    schema_post_2024_08_20:
-      endpoint: "TBD_AFTER_FIRST_RESPONSE"
-      areaNm_present: true
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
+      amount: million KRW
+      volume: REC
+    year_month_format: TBD_AFTER_FIRST_DOWNLOAD
+  kpx_rec_weekly_file:
     column_mapping:
-      area: TBD_AFTER_FIRST_RESPONSE
-      trade_date: TBD_AFTER_FIRST_RESPONSE
-      lng_count: TBD_AFTER_FIRST_RESPONSE
-      oil_count: TBD_AFTER_FIRST_RESPONSE
-      bituminous_coal_count: TBD_AFTER_FIRST_RESPONSE
-      anthracite_count: TBD_AFTER_FIRST_RESPONSE
-      nuclear_count: TBD_AFTER_FIRST_RESPONSE
-    source_fact_checked: true
-    last_verified_at: null
-
-  # ---------------------------------------------------------------------------
-  # P1 — 발전원별 발전량 (계통기준, 5분)
-  # ---------------------------------------------------------------------------
-  kpx_generation_5min:
-    official_name: "한국전력거래소_발전원별 발전량(계통기준)"
-    description: |
-      5-minute generation MW by fuel source: hydro, oil, bituminous coal,
-      nuclear, pumped storage, gas, domestic coal, renewable, solar. Vendor
-      notes that scale and acquisition may differ slightly; use as reference.
-    expected_frequency: "5min"
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
+      avg_price_krw: 평균가
+      base_price_krw: 기준가
+      close_price_krw: 종가
+      high_price_krw: 최고가
+      low_price_krw: 최저가
+      open_price_krw: 시작가
+      rec_volume: 체결 수량
+      total_amount_krw: 체결총액
+      trade_date: 거래일
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: 한국전력거래소_주간 신재생에너지 인증서(REC) 거래현황*.csv
+    frequency: weekly_file_trading_day
+    header_row: 0
+    header_rows: null
+    last_verified_at: '2026-05-24'
+    limitations:
+    - 파일명은 '주간'이지만 row 단위는 trading_day (장 운영일). 비거래일은 row가 없음.
+    - 단가 단위는 KRW/REC. 체결총액 단위는 KRW (백만원 아님 — vendor 헤더 기준).
+    - DST/timezone 영향 없음 (한국 표준시 거래일자).
+    official_name: 한국전력거래소 주간 신재생에너지 인증서(REC) 거래현황
+    schema_version: 1
+    sheet_name: null
+    source_id: kpx_rec_weekly_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15094820/fileData.do
+    trade_date_format: '%Y-%m-%d'
+  kpx_settlement_monthly_file:
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8-sig
+    file_format: csv
+    filename_glob: HOME_전력거래_정산단가_연료원별*.csv
+    frequency: monthly
+    fuel_type_mapping:
+      LNG: lng
+      기타: other
+      석탄_계: coal_total
+      석탄_무연탄: coal_anthracite
+      석탄_유연탄: coal_bituminous
+      신재생_계: renewable
+      양수: pumped_storage
+      원자력: nuclear
+      유류: oil
+      합계: total
+    header_row: 0
+    header_rows: null
+    ignored_columns:
+    - 신재생_연료전지
+    - 신재생_석탄가스화
+    - 신재생_태양
+    - 신재생_풍력
+    - 신재생_수력
+    - 신재생_해양
+    - 신재생_바이오
+    - 신재생_폐기물
+    last_verified_at: '2026-05-24'
+    limitations:
+    - EPSIS 정산단가는 수정정산으로 변동될 수 있음 (M+1 published, ~연 1회 확정).
+    - 정산단가 산정 시 RPS 의무이행비용정산금 + 배출권거래비용정산금은 제외 (EPSIS 공식 설명).
+    - Renewable subcategories (신재생_연료전지/태양/풍력/...) are dropped — only 신재생_계 carried
+      as 'renewable'.
+    official_name: 한국전력거래소 월별 정산단가 (연료원별)
+    period_column: 기간
+    period_format: '%Y/%m'
+    schema_version: 1
+    sheet_name: null
+    source_id: kpx_settlement_monthly_file
+    source_priority: 1
+    source_url: https://epsis.kpx.or.kr/epsisnew/selectEkmaUpsBftChart.do
+    unit: KRW/kWh
+  kpx_smp_monthly_home_avg_file:
     column_mapping:
+      blmp: BLMP|
+      period: 기간|
+      smp_integrated: SMP|통합
+      smp_jeju: SMP|제주
+      smp_mainland: SMP|육지
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    filename_glob: HOME_전력거래_계통한계가격_가중평균SMP*
+    frequency: monthly
+    header_rows:
+    - 0
+    - 1
+    last_verified_at: '2026-05-24'
+    limitations:
+    - Multi-row header; loader flattens via forward-fill + 'level0|level1'.
+    - BLMP column captured but not used by SMP feature pipeline yet.
+    - Same logical data as kpx_smp_monthly_kepco_file; priority 2 (fallback).
+    - Vendor uses literal 0.00 as a 'no published value' marker for some (period,
+      area) pairs (e.g. KEPCO 2015-06 single-month gap; HOME pre-2010 mainland/jeju
+      when only 통합 was tracked). The loader coerces these to NaN and drops them —
+      published KPX SMP has never been 0 KRW/kWh.
+    official_name: HOME 전력거래_계통한계가격 가중평균 SMP (월별)
+    output_areas:
+    - mainland
+    - jeju
+    - integrated
+    period_format: '%Y/%m'
+    schema_version: 1
+    sheet_name: null
+    source_id: kpx_smp_monthly_home_avg_file
+    source_priority: 2
+    source_url: https://epsis.kpx.or.kr/epsisnew/selectEkmaSmpShdChart.do
+    unit: KRW/kWh
+  kpx_smp_monthly_kepco_file:
+    column_mapping:
+      period_month_num: 월
+      period_year: 년도
+      smp_integrated: 통합계통한계가격
+      smp_jeju: 제주계통한계가격
+      smp_mainland: 육지계통한계가격
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: 한국전력거래소_육지 제주 통합 월별 계통한계가격*.csv
+    frequency: monthly
+    header_row: 0
+    header_rows: null
+    last_verified_at: '2026-05-24'
+    limitations:
+    - Manually downloaded snapshot — track collected_at; KPX may revise.
+    - Single file carries 3 areas wide; loader melts to long format.
+    - Vendor uses literal 0.00 as a 'no published value' marker for some (period,
+      area) pairs (e.g. KEPCO 2015-06 single-month gap; HOME pre-2010 mainland/jeju
+      when only 통합 was tracked). The loader coerces these to NaN and drops them —
+      published KPX SMP has never been 0 KRW/kWh.
+    official_name: 한국전력거래소_육지 제주 통합 월별 계통한계가격
+    output_areas:
+    - mainland
+    - jeju
+    - integrated
+    schema_version: 1
+    sheet_name: null
+    source_id: kpx_smp_monthly_kepco_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15043266/fileData.do
+    unit: KRW/kWh
+  kpx_smp_yearly:
+    column_mapping:
+      smp_avg_krw_per_kwh: TBD_AFTER_FIRST_DOWNLOAD
+      year: TBD_AFTER_FIRST_DOWNLOAD
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    eda_only: true
+    encoding: TBD_AFTER_FIRST_DOWNLOAD
+    file_format: TBD_AFTER_FIRST_DOWNLOAD
+    frequency: yearly
+    header_row: 0
+    header_rows: null
+    last_verified_at: null
+    limitations:
+    - Yearly aggregation hides intra-year volatility — EDA only.
+    - Never used as a training target for the monthly model.
+    official_name: 한국전력거래소 연도별 SMP
+    region: TBD_AFTER_FIRST_DOWNLOAD
+    schema_version: 0
+    sheet_name: null
+    source_id: kpx_smp_yearly
+    source_priority: 9
+    source_url: TBD_AFTER_FIRST_DOWNLOAD
+    unit: KRW/kWh
+sources:
+  kma_asos_hourly:
+    column_mapping:
+      humidity_pct: TBD_AFTER_FIRST_RESPONSE
       observed_at: TBD_AFTER_FIRST_RESPONSE
-      hydro_mw: TBD_AFTER_FIRST_RESPONSE
-      oil_mw: TBD_AFTER_FIRST_RESPONSE
+      precipitation_mm: TBD_AFTER_FIRST_RESPONSE
+      solar_radiation: TBD_AFTER_FIRST_RESPONSE
+      station_id: TBD_AFTER_FIRST_RESPONSE
+      sunshine_hours: TBD_AFTER_FIRST_RESPONSE
+      temperature_c: TBD_AFTER_FIRST_RESPONSE
+      wind_speed_ms: TBD_AFTER_FIRST_RESPONSE
+    default_stations:
+    - id: '108'
+      name: Seoul
+    - id: '159'
+      name: Busan
+    - id: '143'
+      name: Daegu
+    - id: '156'
+      name: Gwangju
+    - id: '133'
+      name: Daejeon
+    description: 'Hourly ASOS observations (temperature, humidity, precipitation,
+      wind,
+
+      pressure, solar radiation, sunshine). Use station-level values then
+
+      aggregate by population/demand weighting.
+
+      '
+    expected_frequency: hourly
+    last_verified_at: null
+    official_name: 기상청 ASOS 시간자료
+    source_fact_checked: true
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE
+  kpx_fuel_cost_monthly:
+    column_mapping:
+      fuel_cost: TBD_AFTER_FIRST_RESPONSE
+      fuel_type: TBD_AFTER_FIRST_RESPONSE
+      heat_value_unit_price: TBD_AFTER_FIRST_RESPONSE
+      year_month: TBD_AFTER_FIRST_RESPONSE
+    description: 'Monthly fuel cost / heat-value unit price by fuel type. Used as
+      lag
+
+      features only (future months are unknown at prediction time).
+
+      '
+    expected_frequency: monthly
+    last_verified_at: null
+    official_name: 한국전력거래소_월간 연료비용 정보
+    source_fact_checked: true
+    units:
+      fuel_cost: TBD_AFTER_FIRST_RESPONSE
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE
+  kpx_generation_5min:
+    column_mapping:
       coal_mw: TBD_AFTER_FIRST_RESPONSE
-      nuclear_mw: TBD_AFTER_FIRST_RESPONSE
-      pumped_storage_mw: TBD_AFTER_FIRST_RESPONSE
-      gas_mw: TBD_AFTER_FIRST_RESPONSE
       domestic_coal_mw: TBD_AFTER_FIRST_RESPONSE
+      gas_mw: TBD_AFTER_FIRST_RESPONSE
+      hydro_mw: TBD_AFTER_FIRST_RESPONSE
+      nuclear_mw: TBD_AFTER_FIRST_RESPONSE
+      observed_at: TBD_AFTER_FIRST_RESPONSE
+      oil_mw: TBD_AFTER_FIRST_RESPONSE
+      pumped_storage_mw: TBD_AFTER_FIRST_RESPONSE
       renewable_mw: TBD_AFTER_FIRST_RESPONSE
       solar_mw: TBD_AFTER_FIRST_RESPONSE
-    units: { generation: "MW" }
-    source_fact_checked: true
-    last_verified_at: null
+    description: '5-minute generation MW by fuel source: hydro, oil, bituminous coal,
 
-  # ---------------------------------------------------------------------------
-  # P1 — 월간 연료비용 정보
-  # ---------------------------------------------------------------------------
-  kpx_fuel_cost_monthly:
-    official_name: "한국전력거래소_월간 연료비용 정보"
-    description: |
-      Monthly fuel cost / heat-value unit price by fuel type. Used as lag
-      features only (future months are unknown at prediction time).
-    expected_frequency: monthly
+      nuclear, pumped storage, gas, domestic coal, renewable, solar. Vendor
+
+      notes that scale and acquisition may differ slightly; use as reference.
+
+      '
+    expected_frequency: 5min
+    last_verified_at: null
+    official_name: 한국전력거래소_발전원별 발전량(계통기준)
+    source_fact_checked: true
+    units:
+      generation: MW
     verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
-    column_mapping:
-      year_month: TBD_AFTER_FIRST_RESPONSE
-      fuel_type: TBD_AFTER_FIRST_RESPONSE
-      fuel_cost: TBD_AFTER_FIRST_RESPONSE
-      heat_value_unit_price: TBD_AFTER_FIRST_RESPONSE
-    units: { fuel_cost: "TBD_AFTER_FIRST_RESPONSE" }
-    source_fact_checked: true
-    last_verified_at: null
-
-  # ---------------------------------------------------------------------------
-  # P2 — 월별 정산단가 (REC/settlement 확장용)
-  # ---------------------------------------------------------------------------
-  kpx_settlement_monthly:
-    official_name: "한국전력거래소_월별 정산단가"
-    description: |
-      Monthly settlement unit price by fuel/member. Values may be revised by
-      final/correction settlement; track raw_snapshot_date, source_modified
-      _date, etl_run_at separately.
-    expected_frequency: monthly
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
-    column_mapping:
-      year_month: TBD_AFTER_FIRST_RESPONSE
-      category_type: TBD_AFTER_FIRST_RESPONSE
-      category_name: TBD_AFTER_FIRST_RESPONSE
-      settlement_unit_price: TBD_AFTER_FIRST_RESPONSE
-    units: { settlement_unit_price: "KRW/kWh" }
-    source_fact_checked: true
-    last_verified_at: null
-
-  # ---------------------------------------------------------------------------
-  # P2 — REC 현물시장 / 월간 거래현황
-  # ---------------------------------------------------------------------------
-  kpx_rec_spot:
-    official_name: "한국전력거래소_REC 현물시장 정보"
-    description: |
-      Trading-day-level REC spot market summary (count, avg price, volume,
-      amount) by mainland/Jeju. Non-trading days have no record; do not
-      forward-fill price into a daily calendar.
-    expected_frequency: trading_day
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
-    column_mapping:
-      trade_date: TBD_AFTER_FIRST_RESPONSE
-      area: TBD_AFTER_FIRST_RESPONSE
-      trade_count: TBD_AFTER_FIRST_RESPONSE
-      avg_price: TBD_AFTER_FIRST_RESPONSE
-      trade_volume: TBD_AFTER_FIRST_RESPONSE
-      trade_amount: TBD_AFTER_FIRST_RESPONSE
-    units: { avg_price: "KRW/REC", trade_amount: "TBD_AFTER_FIRST_RESPONSE" }
-    source_fact_checked: true
-    last_verified_at: null
-
+    - TBD_AFTER_FIRST_RESPONSE
   kpx_rec_monthly:
-    official_name: "한국전력거래소_신에너지 및 재생에너지 공급인증서 거래량"
-    description: |
-      Monthly REC market summary: spot volume, contract volume, spot amount
-      (million KRW), contract amount (million KRW).
-    expected_frequency: monthly
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
     column_mapping:
-      year_month: TBD_AFTER_FIRST_RESPONSE
-      spot_volume_rec: TBD_AFTER_FIRST_RESPONSE
+      contract_amount_million_krw: TBD_AFTER_FIRST_RESPONSE
       contract_volume_rec: TBD_AFTER_FIRST_RESPONSE
       spot_amount_million_krw: TBD_AFTER_FIRST_RESPONSE
-      contract_amount_million_krw: TBD_AFTER_FIRST_RESPONSE
-    units:
-      volume: "REC"
-      amount: "million KRW"
-    source_fact_checked: true
-    last_verified_at: null
+      spot_volume_rec: TBD_AFTER_FIRST_RESPONSE
+      year_month: TBD_AFTER_FIRST_RESPONSE
+    description: 'Monthly REC market summary: spot volume, contract volume, spot amount
 
-  # ---------------------------------------------------------------------------
-  # P1 — 기상청 ASOS (시간자료)
-  # ---------------------------------------------------------------------------
-  kma_asos_hourly:
-    official_name: "기상청 ASOS 시간자료"
-    description: |
-      Hourly ASOS observations (temperature, humidity, precipitation, wind,
-      pressure, solar radiation, sunshine). Use station-level values then
-      aggregate by population/demand weighting.
-    expected_frequency: hourly
-    default_stations:
-      - { id: "108", name: "Seoul" }
-      - { id: "159", name: "Busan" }
-      - { id: "143", name: "Daegu" }
-      - { id: "156", name: "Gwangju" }
-      - { id: "133", name: "Daejeon" }
-    verified_columns:
-      - TBD_AFTER_FIRST_RESPONSE
-    column_mapping:
-      station_id: TBD_AFTER_FIRST_RESPONSE
-      observed_at: TBD_AFTER_FIRST_RESPONSE
-      temperature_c: TBD_AFTER_FIRST_RESPONSE
-      humidity_pct: TBD_AFTER_FIRST_RESPONSE
-      precipitation_mm: TBD_AFTER_FIRST_RESPONSE
-      wind_speed_ms: TBD_AFTER_FIRST_RESPONSE
-      solar_radiation: TBD_AFTER_FIRST_RESPONSE
-      sunshine_hours: TBD_AFTER_FIRST_RESPONSE
-    source_fact_checked: true
+      (million KRW), contract amount (million KRW).
+
+      '
+    expected_frequency: monthly
     last_verified_at: null
+    official_name: 한국전력거래소_신에너지 및 재생에너지 공급인증서 거래량
+    source_fact_checked: true
+    units:
+      amount: million KRW
+      volume: REC
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE
+  kpx_rec_spot:
+    column_mapping:
+      area: TBD_AFTER_FIRST_RESPONSE
+      avg_price: TBD_AFTER_FIRST_RESPONSE
+      trade_amount: TBD_AFTER_FIRST_RESPONSE
+      trade_count: TBD_AFTER_FIRST_RESPONSE
+      trade_date: TBD_AFTER_FIRST_RESPONSE
+      trade_volume: TBD_AFTER_FIRST_RESPONSE
+    description: 'Trading-day-level REC spot market summary (count, avg price, volume,
+
+      amount) by mainland/Jeju. Non-trading days have no record; do not
+
+      forward-fill price into a daily calendar.
+
+      '
+    expected_frequency: trading_day
+    last_verified_at: null
+    official_name: 한국전력거래소_REC 현물시장 정보
+    source_fact_checked: true
+    units:
+      avg_price: KRW/REC
+      trade_amount: TBD_AFTER_FIRST_RESPONSE
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE
+  kpx_settlement_monthly:
+    column_mapping:
+      category_name: TBD_AFTER_FIRST_RESPONSE
+      category_type: TBD_AFTER_FIRST_RESPONSE
+      settlement_unit_price: TBD_AFTER_FIRST_RESPONSE
+      year_month: TBD_AFTER_FIRST_RESPONSE
+    description: 'Monthly settlement unit price by fuel/member. Values may be revised
+      by
+
+      final/correction settlement; track raw_snapshot_date, source_modified
+
+      _date, etl_run_at separately.
+
+      '
+    expected_frequency: monthly
+    last_verified_at: null
+    official_name: 한국전력거래소_월별 정산단가
+    source_fact_checked: true
+    units:
+      settlement_unit_price: KRW/kWh
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE
+  kpx_smp_day_ahead:
+    base_url: TBD_AFTER_FIRST_RESPONSE
+    column_mapping:
+      area: TBD_AFTER_FIRST_RESPONSE
+      demand_forecast_mw: TBD_AFTER_FIRST_RESPONSE
+      smp_krw_per_kwh: TBD_AFTER_FIRST_RESPONSE
+      trade_date: TBD_AFTER_FIRST_RESPONSE
+      trade_hour: TBD_AFTER_FIRST_RESPONSE
+    description: 'Hourly system marginal price (SMP) and demand forecast for mainland
+      and
+
+      Jeju. Updated once per day around 23:00. Each trade hour represents the
+
+      interval ending at that hour.
+
+      '
+    expected_frequency: hourly
+    expected_regions:
+    - 육지
+    - 제주
+    interval_convention: end
+    last_verified_at: null
+    official_name: 한국전력거래소_계통한계가격 및 수요예측(하루전 발전계획용)
+    operation: TBD_AFTER_FIRST_RESPONSE
+    request_params:
+      base_date_param: TBD_AFTER_FIRST_RESPONSE
+      num_of_rows: numOfRows
+      page_no: pageNo
+      service_key: serviceKey
+      type: type
+    response_format: json
+    schema_version: 0
+    source_fact_checked: true
+    units:
+      demand_forecast: TBD_AFTER_FIRST_RESPONSE
+      smp: KRW/kWh
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE
+  kpx_smp_decision_by_fuel:
+    column_mapping:
+      anthracite_count: TBD_AFTER_FIRST_RESPONSE
+      area: TBD_AFTER_FIRST_RESPONSE
+      bituminous_coal_count: TBD_AFTER_FIRST_RESPONSE
+      lng_count: TBD_AFTER_FIRST_RESPONSE
+      nuclear_count: TBD_AFTER_FIRST_RESPONSE
+      oil_count: TBD_AFTER_FIRST_RESPONSE
+      trade_date: TBD_AFTER_FIRST_RESPONSE
+    description: 'Daily count by fuel type (LNG, oil, bituminous coal, anthracite,
+
+      nuclear) of how often each fuel set the SMP. From 2024-08-20 mainland
+
+      and Jeju are reported separately and the endpoint changed to
+
+      `SmpDecByFuel2/getSmpDecByFuel2` with an `areaNm` field.
+
+      '
+    last_verified_at: null
+    official_name: 한국전력거래소_연료원별 SMP 결정 횟수(일별)
+    schema_post_2024_08_20:
+      areaNm_present: true
+      endpoint: TBD_AFTER_FIRST_RESPONSE
+    schema_pre_2024_08_20:
+      areaNm_present: false
+      endpoint: TBD_AFTER_FIRST_RESPONSE
+    source_fact_checked: true
+    verified_columns:
+    - TBD_AFTER_FIRST_RESPONSE

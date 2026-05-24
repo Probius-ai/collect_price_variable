@@ -39,3 +39,21 @@ class SeasonalNaiveLag168h(NaiveLag24h):
 
     def __init__(self, lag_column: str = "smp_lag_168h") -> None:
         super().__init__(lag_column=lag_column)
+
+
+class NaiveLag1m(NaiveLag24h):
+    """Monthly naive baseline: predicts target as previous-month SMP."""
+
+    name = "naive_lag_1m"
+
+    def __init__(self, lag_column: str = "smp_lag_1m") -> None:
+        super().__init__(lag_column=lag_column)
+
+
+class SeasonalNaiveLag12m(NaiveLag24h):
+    """Monthly seasonal baseline: same-month-last-year SMP."""
+
+    name = "seasonal_naive_lag_12m"
+
+    def __init__(self, lag_column: str = "smp_lag_12m") -> None:
+        super().__init__(lag_column=lag_column)

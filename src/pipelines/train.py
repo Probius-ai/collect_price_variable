@@ -21,31 +21,43 @@ import typer
 from src.config.settings import get_settings
 from src.models.lightgbm_model import LightGBMModel
 from src.models.metrics import compute_metrics
-from src.models.naive import NaiveLag24h, SeasonalNaiveLag168h
+from src.models.naive import (
+    NaiveLag1m,
+    NaiveLag24h,
+    SeasonalNaiveLag12m,
+    SeasonalNaiveLag168h,
+)
 from src.models.ridge_model import RidgeModel
 from src.utils.logging import get_logger
 
 app = typer.Typer(help="Train SMP forecasting models.")
 
 MODELS = {
-    "naive": NaiveLag24h,
+    "naive": NaiveLag24h,                  # hourly
     "seasonal_naive": SeasonalNaiveLag168h,
+    "naive_lag_1m": NaiveLag1m,            # monthly
+    "seasonal_naive_lag_12m": SeasonalNaiveLag12m,
     "ridge": RidgeModel,
     "lightgbm": LightGBMModel,
 }
 
 
 def _split_chronological(
-    df: pd.DataFrame, valid_frac: float, test_frac: float, ts_col: str
+    df: pd.DataFrame,
+    valid_frac: float,
+    test_frac: float,
+    ts_col: str,
+    min_train_rows: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = df.sort_values(ts_col).reset_index(drop=True)
     n = len(df)
     n_test = int(n * test_frac)
     n_valid = int(n * valid_frac)
     n_train = n - n_test - n_valid
-    if n_train < 168:
+    if n_train < min_train_rows:
         raise ValueError(
-            f"Train split too small ({n_train} rows) for hourly SMP modelling"
+            f"Train split too small ({n_train} rows < min_train_rows={min_train_rows}). "
+            "Lower --valid-frac / --test-frac or pass --min-train-rows."
         )
     return df.iloc[:n_train], df.iloc[n_train : n_train + n_valid], df.iloc[n_train + n_valid :]
 
@@ -58,6 +70,10 @@ def main(
     timestamp_col: str = typer.Option("interval_end"),
     valid_frac: float = typer.Option(0.15),
     test_frac: float = typer.Option(0.15),
+    min_train_rows: int = typer.Option(
+        24,
+        help="Minimum train rows required (hourly: ≥168 recommended; monthly: ≥24).",
+    ),
     output_dir: Optional[Path] = typer.Option(None, help="Defaults to outputs/<model>/"),
 ):
     log = get_logger("train")
@@ -73,7 +89,9 @@ def main(
     drop_cols = {target, timestamp_col, "area"}
     feature_cols = [c for c in df.columns if c not in drop_cols]
 
-    train_df, valid_df, test_df = _split_chronological(df, valid_frac, test_frac, timestamp_col)
+    train_df, valid_df, test_df = _split_chronological(
+        df, valid_frac, test_frac, timestamp_col, min_train_rows
+    )
     log.info(
         "Split sizes: train=%d valid=%d test=%d", len(train_df), len(valid_df), len(test_df)
     )
