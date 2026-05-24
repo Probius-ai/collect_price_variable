@@ -124,6 +124,18 @@ class BaseFileLoader(abc.ABC):
             raw_copy_path = target_dir / f"raw_{_stamp(collected_at)}{file_path.suffix.lower()}"
             shutil.copy2(file_path, raw_copy_path)
 
+            # Stamp every parsed row with the revision-metadata the downstream
+            # feature builder needs to deterministically pick the latest snapshot
+            # when the same (period_month, area) is loaded more than once.
+            # Compute the future parsed_path BEFORE writing so it matches the
+            # path that write_parsed_dataframe will produce (same `collected_at`
+            # → same `_stamp`).
+            future_parsed_path = target_dir / f"parsed_{_stamp(collected_at)}.parquet"
+            df = df.copy()
+            df["source_file_sha256"] = run.file_sha256
+            df["source_priority"] = self.config.get("source_priority")
+            df["parsed_path"] = str(future_parsed_path)
+
             parsed_path = write_parsed_dataframe(
                 self.source_name, df, event_date=event_date, collected_at=collected_at
             )

@@ -193,3 +193,81 @@ def test_priority_dedup_prefers_lower_number(tmp_path, monkeypatch):
     assert {"kpx_smp_monthly_kepco_file", "kpx_smp_monthly_home_avg_file"}.issubset(
         set(log["source_id"])
     )
+    # The dropped row's reason must be "lower_priority"
+    dropped_main = log[
+        (log["area"] == "mainland")
+        & (log["role"] == "dropped")
+    ]
+    assert len(dropped_main) == 1
+    assert dropped_main.iloc[0]["reason"] == "lower_priority"
+
+
+def test_revision_dedup_prefers_newer_collected_at(tmp_path, monkeypatch):
+    """Same-source same-(period,area) snapshots: latest collected_at wins.
+
+    Regression for the Codex adversarial-review finding: when KPX/EPSIS
+    publishes a corrected SMP value, a later re-load creates a second
+    parsed_*.parquet for the same (period_month, area). The feature builder
+    must pick the NEWER snapshot and record the OLDER one as dropped with
+    reason=``older_revision``.
+    """
+    from src.utils import io as io_mod
+    import importlib
+
+    class _Stub:
+        data_dir = tmp_path / "data"
+    monkeypatch.setattr(io_mod, "get_settings", lambda: _Stub())
+    bm = importlib.reload(importlib.import_module("src.features.build_monthly"))
+
+    base = pd.DataFrame({
+        "period_month": [pd.Timestamp("2025-01-01")],
+        "area": ["mainland"],
+        "smp_krw_per_kwh": [100.0],  # value A — original publication
+        "source_id": "kpx_smp_monthly_kepco_file",
+        "collected_at": pd.Timestamp("2026-04-01T12:00:00"),  # older
+        "source_file": "kepco_2025_01_v1.csv",
+        "source_file_sha256": "a" * 64,
+        "source_priority": 1,
+    })
+    revised = base.copy()
+    revised["smp_krw_per_kwh"] = [123.45]  # value B — corrected publication
+    revised["collected_at"] = pd.Timestamp("2026-05-01T09:30:00")  # newer
+    revised["source_file"] = "kepco_2025_01_v2.csv"
+    revised["source_file_sha256"] = "b" * 64
+
+    # Both snapshots land in the SAME source-root subdir but under different
+    # event-date partitions, mimicking two re-loads of the same period.
+    root = bm.source_root_dir("kpx_smp_monthly_kepco_file")
+    old_dir = root / "2025" / "01" / "01"
+    new_dir = root / "2025" / "01" / "02"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    new_dir.mkdir(parents=True, exist_ok=True)
+    base.to_parquet(old_dir / "parsed_20260401T120000Z.parquet", index=False)
+    revised.to_parquet(new_dir / "parsed_20260501T093000Z.parquet", index=False)
+
+    long = bm.load_smp_monthly_long()
+    row = long[
+        (long["period_month"] == pd.Timestamp("2025-01-01"))
+        & (long["area"] == "mainland")
+    ]
+    assert len(row) == 1, "Same (period, area) must collapse to a single row"
+    selected = row.iloc[0]
+    assert selected["smp_krw_per_kwh"] == 123.45, (
+        "Newer collected_at must supersede the older revision"
+    )
+    assert selected["source_file_sha256"] == "b" * 64
+    assert "v2" in selected["source_file"]
+    assert selected["collected_at"] == pd.Timestamp("2026-05-01T09:30:00")
+
+    log = long.attrs["_priority_dedup_log"]
+    sel_rows = log[(log["area"] == "mainland") & (log["role"] == "selected")]
+    drop_rows = log[(log["area"] == "mainland") & (log["role"] == "dropped")]
+    assert len(sel_rows) == 1 and len(drop_rows) == 1
+    assert sel_rows.iloc[0]["smp_krw_per_kwh"] == 123.45
+    assert sel_rows.iloc[0]["source_file_sha256"] == "b" * 64
+    assert drop_rows.iloc[0]["smp_krw_per_kwh"] == 100.0, (
+        "The older value must be recorded as the dropped candidate"
+    )
+    assert drop_rows.iloc[0]["source_file_sha256"] == "a" * 64
+    assert drop_rows.iloc[0]["collected_at"] == pd.Timestamp("2026-04-01T12:00:00")
+    assert drop_rows.iloc[0]["reason"] == "older_revision"

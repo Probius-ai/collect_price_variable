@@ -131,12 +131,54 @@ def add_calendar_features(
 SMP_SOURCES = ["kpx_smp_monthly_kepco_file", "kpx_smp_monthly_home_avg_file"]
 
 
+REVISION_META_COLUMNS = [
+    "collected_at",
+    "source_file_sha256",
+    "source_file",
+    "parsed_path",
+    "source_id",
+    "source_priority",
+]
+
+
 def _load_one_source_parquet(source_name: str) -> pd.DataFrame:
+    """Read every parsed snapshot for a source and stamp each row with the
+    revision-metadata needed for deterministic de-duplication.
+
+    Older parquets may pre-date the loader change that began writing
+    ``source_file_sha256``, ``source_priority``, and ``parsed_path`` into the
+    parsed dataframe. For those rows we fill the missing fields from
+    ``sources.yaml`` and the parquet path itself so that the new dedup
+    contract still applies uniformly.
+    """
     root = source_root_dir(source_name)
     files = sorted(root.rglob("parsed_*.parquet"))
     if not files:
         return pd.DataFrame()
-    return pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
+    priority_fallback = _source_priority(source_name)
+    frames: list[pd.DataFrame] = []
+    for p in files:
+        df = pd.read_parquet(p)
+        if df.empty:
+            continue
+        # parsed_path is intrinsic to the file just read — always overwrite.
+        df["parsed_path"] = str(p)
+        if "source_priority" not in df.columns:
+            df["source_priority"] = priority_fallback
+        else:
+            df["source_priority"] = (
+                df["source_priority"].fillna(priority_fallback).astype("int64")
+            )
+        if "source_file_sha256" not in df.columns:
+            df["source_file_sha256"] = ""
+        else:
+            df["source_file_sha256"] = df["source_file_sha256"].fillna("").astype(str)
+        if "source_id" not in df.columns:
+            df["source_id"] = source_name
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def _source_priority(source_id: str) -> int:
@@ -150,9 +192,25 @@ def _source_priority(source_id: str) -> int:
 def load_smp_monthly_long(sources: list[str] | None = None) -> pd.DataFrame:
     """Read all monthly SMP sources into a single long-format frame.
 
-    Duplicates on (period_month, area) are resolved by source_priority
-    (lower number wins). The resolution decisions are recorded as side-info
-    on the returned dataframe via ``df.attrs['_priority_dedup_log']``.
+    De-duplication contract for (period_month, area):
+      1. Lower ``source_priority`` wins (KEPCO < HOME in our config).
+      2. Within the same priority, the snapshot with the LATEST
+         ``collected_at`` wins — this means a corrected re-load supersedes
+         the older snapshot for the same period.
+      3. Ties are broken deterministically by ``source_file_sha256`` then
+         by ``parsed_path``, both ascending.
+
+    The resolution decisions are recorded on the returned dataframe via
+    ``df.attrs['_priority_dedup_log']``. Each conflicting (period_month, area)
+    contributes ONE row per candidate (selected + dropped) with columns:
+
+        period_month, area, source_id, source_priority, smp_krw_per_kwh,
+        collected_at, source_file_sha256, parsed_path, role, reason
+
+    ``role`` is one of ``"selected"`` / ``"dropped"``. ``reason`` is
+    ``"lower_priority"`` if the row lost to a higher-priority source, or
+    ``"older_revision"`` if it lost to a same-priority newer snapshot.
+    The legacy ``_priority`` alias column is preserved for backward compat.
     """
     sources = sources or SMP_SOURCES
     frames: list[pd.DataFrame] = []
@@ -160,7 +218,6 @@ def load_smp_monthly_long(sources: list[str] | None = None) -> pd.DataFrame:
         df = _load_one_source_parquet(src)
         if df.empty:
             continue
-        df["_priority"] = _source_priority(src)
         frames.append(df)
     if not frames:
         raise FileNotFoundError(
@@ -169,19 +226,80 @@ def load_smp_monthly_long(sources: list[str] | None = None) -> pd.DataFrame:
         )
     long = pd.concat(frames, ignore_index=True)
     long["period_month"] = pd.to_datetime(long["period_month"])
-    long = long.sort_values(["period_month", "area", "_priority"]).reset_index(drop=True)
+    long["collected_at"] = pd.to_datetime(long["collected_at"], errors="coerce")
+    long["source_priority"] = long["source_priority"].astype("int64")
+    long["source_file_sha256"] = long["source_file_sha256"].fillna("").astype(str)
+    long["parsed_path"] = long["parsed_path"].astype(str)
 
-    # Build a dedup log capturing any (period_month, area) where multiple
-    # sources disagreed BEFORE we keep the winner.
-    dup_mask = long.duplicated(subset=["period_month", "area"], keep=False)
-    dup_log = long.loc[dup_mask, [
-        "period_month", "area", "source_id", "_priority", "smp_krw_per_kwh"
-    ]].copy()
+    # Multi-key sort. NB: pandas treats NaT as "smallest" by default, which
+    # would let a snapshot with a missing collected_at beat real revisions.
+    # We materialise a sortable rank that pushes NaT to the bottom (oldest).
+    epoch_seconds = (
+        long["collected_at"].astype("int64") // 10**9
+    ).where(long["collected_at"].notna(), other=np.int64(np.iinfo(np.int64).min))
+    long["_collected_at_rank"] = epoch_seconds
+    long_sorted = long.sort_values(
+        by=[
+            "period_month",
+            "area",
+            "source_priority",
+            "_collected_at_rank",
+            "source_file_sha256",
+            "parsed_path",
+        ],
+        ascending=[True, True, True, False, True, True],
+        kind="mergesort",  # stable
+    ).reset_index(drop=True)
 
-    deduped = long.drop_duplicates(subset=["period_month", "area"], keep="first").drop(
-        columns=["_priority"]
+    # Build the revision log BEFORE dropping duplicates.
+    dup_mask = long_sorted.duplicated(subset=["period_month", "area"], keep=False)
+    candidates = long_sorted.loc[dup_mask].copy()
+
+    if candidates.empty:
+        dedup_log = pd.DataFrame(
+            columns=[
+                "period_month", "area", "source_id", "source_priority",
+                "smp_krw_per_kwh", "collected_at", "source_file_sha256",
+                "parsed_path", "role", "reason", "_priority",
+            ]
+        )
+    else:
+        # The first row in each (period_month, area) group is the winner because
+        # of the multi-key sort above.
+        first_pos = candidates.groupby(
+            ["period_month", "area"], sort=False
+        ).head(1).index
+        candidates["role"] = "dropped"
+        candidates.loc[first_pos, "role"] = "selected"
+
+        selected_priority = (
+            candidates.loc[candidates["role"] == "selected"]
+            .set_index(["period_month", "area"])["source_priority"]
+            .to_dict()
+        )
+
+        def _reason(row: pd.Series) -> str:
+            if row["role"] == "selected":
+                return ""
+            sel_p = selected_priority.get((row["period_month"], row["area"]))
+            if sel_p is None or row["source_priority"] > sel_p:
+                return "lower_priority"
+            return "older_revision"
+
+        candidates["reason"] = candidates.apply(_reason, axis=1)
+        candidates["_priority"] = candidates["source_priority"]
+        dedup_log = candidates[[
+            "period_month", "area", "source_id", "source_priority",
+            "smp_krw_per_kwh", "collected_at", "source_file_sha256",
+            "parsed_path", "role", "reason", "_priority",
+        ]].reset_index(drop=True)
+
+    deduped = (
+        long_sorted.drop_duplicates(subset=["period_month", "area"], keep="first")
+        .drop(columns=["_collected_at_rank"])
+        .reset_index(drop=True)
     )
-    deduped.attrs["_priority_dedup_log"] = dup_log
+    deduped.attrs["_priority_dedup_log"] = dedup_log
     return deduped
 
 
