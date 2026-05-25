@@ -4,6 +4,7 @@ collection timestamp + source metadata, as required by Plan.md §15.1."""
 from __future__ import annotations
 
 import abc
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -16,6 +17,34 @@ from src.config.settings import get_source_config, get_source_defaults
 from src.utils.io import RawSavePaths, persist_collector_output
 from src.utils.logging import get_logger
 from src.utils.time import collected_now_utc
+
+
+# Kwarg names that, when passed to `collect(**kwargs)`, should NOT be
+# persisted verbatim to `metadata_*.json`. Without this scrub, a caller
+# that explicitly passes `api_key=…` (the override path used by the KMA
+# collectors for testing) would leak the key value to disk because
+# `CollectorRun.params = kwargs` ends up in `to_metadata()`.
+_CREDENTIAL_KWARG_RE = re.compile(
+    r"(key|token|secret|auth|password|passwd|pwd|credential|cookie|session|sso)",
+    re.IGNORECASE,
+)
+
+
+def _scrub_credential_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of `kwargs` with credential-shaped values redacted.
+
+    Mirrors the dashboard's display-time `_CRED_ENV_NAME_RE` heuristic:
+    any kwarg whose NAME matches the credential pattern gets its value
+    replaced with `<REDACTED>`. We don't try to introspect the value
+    type — a caller naming something `api_key` is declaring intent.
+    """
+    safe: dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if isinstance(k, str) and _CREDENTIAL_KWARG_RE.search(k):
+            safe[k] = "<REDACTED>"
+        else:
+            safe[k] = v
+    return safe
 
 
 class CollectorError(RuntimeError):
@@ -113,11 +142,16 @@ class BaseCollector(abc.ABC):
         return self.fetch_one(**params)
 
     def collect(self, **params: Any) -> CollectorRun:
+        # Scrub credential-shaped kwargs (e.g. an explicit api_key= override)
+        # before storing on the run record — `params` ends up in
+        # `metadata_*.json` via `to_metadata()`, and we don't want any
+        # secret to land on disk just because someone passed it as a
+        # kwarg instead of via settings.
         run = CollectorRun(
             run_id=str(uuid.uuid4()),
             source=self.source_name,
             started_at=collected_now_utc(),
-            params=params,
+            params=_scrub_credential_kwargs(params),
         )
         try:
             fetch_result = self.fetch_with_retry(**params)

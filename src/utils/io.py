@@ -73,11 +73,29 @@ def write_raw_payload(
     event_date: date | None = None,
     suffix: str = ".json",
     collected_at: datetime | None = None,
+    name_suffix: str | None = None,
 ) -> Path:
+    """Persist a verbatim raw API payload.
+
+    `_stamp` is second-resolution. Two same-second writes (e.g. a tenacity
+    retry burst on a flaky 5xx) would silently overwrite each other without
+    a disambiguator. Callers that may write multiple files per second
+    MUST pass a `name_suffix` — when set, the resulting filename becomes
+    ``response_<stamp>__<suffix>.<ext>`` and an existing path raises
+    ``FileExistsError`` rather than overwriting (matching
+    ``write_parsed_dataframe`` / ``write_metadata`` semantics).
+    """
     directory = raw_response_dir(source, event_date)
     directory.mkdir(parents=True, exist_ok=True)
     stamp = _stamp(collected_at)
-    path = directory / f"response_{stamp}{suffix}"
+    ext = suffix.lstrip(".")
+    filename = _snapshot_basename("response", stamp, name_suffix, ext)
+    path = directory / filename
+    if name_suffix and path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite existing raw payload: {path}. "
+            "Pass a more specific name_suffix."
+        )
     path.write_text(payload_text, encoding="utf-8")
     logger.info("Wrote raw payload: %s (%d bytes)", path, len(payload_text))
     return path
