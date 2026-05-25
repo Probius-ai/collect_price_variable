@@ -272,6 +272,66 @@ def test_no_production_auto_promotion(smoke_results: pd.DataFrame, tmp_path: Pat
             assert "prod" not in (r.get("promotion_status") or "").lower(), r
 
 
+def test_training_pool_excludes_rows_whose_target_is_after_cutoff(
+    synthetic_panel: Path,
+):
+    """Round-MLops-review fix: a row at ``period_month == cutoff`` has
+    target = SMP(cutoff + horizon), which is in the FUTURE relative to
+    the simulated retraining moment. Including it would leak future
+    labels into the training fit. The strict-correct training filter
+    must exclude such rows.
+    """
+    df = pd.read_parquet(synthetic_panel)
+    cutoff = pd.Timestamp("2021-12-01")
+
+    # Strict filter (h=1): row at 2021-12 is dropped because its target
+    # is SMP(2022-01) — not observable at end-of-2021-12.
+    strict = filter_to_cutoff(df, data_cutoff_month=cutoff, horizon_months=1)
+    assert pd.to_datetime(strict["period_month"]).max() == pd.Timestamp("2021-11-01"), (
+        "Strict-mode filter must drop the boundary row whose target leaks "
+        "into the simulated future."
+    )
+
+    # And every row in the strict pool has target_month <= cutoff
+    pm = pd.to_datetime(strict["period_month"])
+    target_month = pm + pd.DateOffset(months=1)
+    assert (target_month <= cutoff).all(), (
+        "Strict filter let through rows with future target months."
+    )
+
+    # Loose filter (h=0) keeps the boundary row — used for the
+    # canary leak-safety tests above and for test-set selection where
+    # the labels are observable in retrospect.
+    loose = filter_to_cutoff(df, data_cutoff_month=cutoff)
+    assert pd.to_datetime(loose["period_month"]).max() == cutoff
+
+
+def test_strict_pool_actually_used_by_smoke_test_training(
+    smoke_results: pd.DataFrame, synthetic_panel: Path,
+):
+    """End-to-end: confirm the smoke test's reported n_train for each
+    historical version equals the count of rows whose TARGET month is
+    observable at cutoff — not the count of rows whose period_month is."""
+    df = pd.read_parquet(synthetic_panel)
+    for vcfg_name, cutoff_str in [
+        ("v1", "2021-12-01"), ("v2", "2022-12-01"),
+        ("v3", "2023-12-01"), ("v4", "2024-12-01"),
+    ]:
+        cutoff = pd.Timestamp(cutoff_str)
+        strict_pool = filter_to_cutoff(df, data_cutoff_month=cutoff, horizon_months=1)
+        expected_n_train = int(strict_pool["target_smp_t_plus_h_months"].notna().sum())
+        # Pick any fixed_holdout row for that version (n_train is the same
+        # across models in a version since models share the same panel filter)
+        actual_n_train = int(
+            smoke_results[(smoke_results["version"] == vcfg_name)]["n_train"].max()
+        )
+        assert actual_n_train == expected_n_train, (
+            f"{vcfg_name}: smoke test reported n_train={actual_n_train} "
+            f"but strict pool has {expected_n_train} rows. The training "
+            f"filter is not using the target-observability bound."
+        )
+
+
 def test_v5_not_marked_as_fixed_holdout_without_future_labels(
     smoke_results: pd.DataFrame, tmp_path: Path,
 ):

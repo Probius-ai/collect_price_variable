@@ -176,17 +176,42 @@ def filter_to_cutoff(
     df: pd.DataFrame,
     *,
     data_cutoff_month: pd.Timestamp,
+    horizon_months: int = 0,
 ) -> pd.DataFrame:
-    """Restrict the feature table to rows whose ``period_month`` is
-    strictly at or before the simulated retraining date.
+    """Restrict the feature table to rows observable at the cutoff.
 
-    This is the load-bearing leak-safety check — every test that pins
-    "vN doesn't use data after the cutoff" exercises THIS function.
+    Two modes:
+
+    * ``horizon_months=0`` (default) — keep rows where
+      ``period_month <= data_cutoff_month``. This is the "features
+      observable" filter — every input column for that row was computed
+      from data available by end-of-cutoff-month.
+
+    * ``horizon_months>0`` — also enforce that the row's TARGET would
+      have been observable by the cutoff, i.e. ``period_month + horizon
+      <= cutoff``. This is the **strict-correct filter for training
+      data**: a row whose target month is in the future relative to the
+      simulated retraining moment carries a label that didn't exist at
+      retraining time, and including it leaks future information into
+      the fit. For h=1 monthly, this means dropping the row at
+      ``period_month == cutoff`` (target = cutoff + 1 = future).
+
+    The looser ``horizon_months=0`` form is kept for the test-set path
+    (where we DO want to score predictions against retrospectively-
+    observable labels) and for the structural leak-safety canaries that
+    just check "no rows after cutoff".
     """
     if "period_month" not in df.columns:
         raise KeyError("Feature table missing required column `period_month`")
     pm = pd.to_datetime(df["period_month"])
-    return df.loc[pm <= data_cutoff_month].copy()
+    if horizon_months > 0:
+        # Target month = period_month + horizon. Require it to be
+        # observable at the cutoff (i.e., <= cutoff).
+        target_month = pm + pd.DateOffset(months=horizon_months)
+        mask = target_month <= data_cutoff_month
+    else:
+        mask = pm <= data_cutoff_month
+    return df.loc[mask].copy()
 
 
 def _split_train_test(
@@ -270,21 +295,29 @@ def _evaluate_latest_rolling_validation(
     target_col: str,
     data_cutoff_month: pd.Timestamp,
     window_months: int,
+    horizon_months: int = 1,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Backward walk-forward over the last `window_months` months ending
     at `data_cutoff_month`.
 
     For each month m in [cutoff - window+1 ... cutoff], fit a fresh model
-    on rows strictly before m and predict the target at m. This is the
+    on rows whose TARGET is observable strictly before m (i.e.
+    period_month + horizon < m), and predict the target at m. This is the
     "production-like" evaluation used when no future holdout labels exist.
+
+    Key leak-safety detail: we filter by ``period_month + horizon < m``,
+    NOT ``period_month < m`` — the latter would let a fold's training
+    pool include a row whose target IS m or beyond, leaking the eval
+    label into training.
     """
     pm = pd.to_datetime(panel["period_month"])
+    target_month = pm + pd.DateOffset(months=horizon_months)
     months = pd.date_range(
         end=data_cutoff_month, periods=window_months, freq="MS"
     )
     rows: list[dict[str, Any]] = []
     for m in months:
-        train_mask = (pm < m) & panel[target_col].notna()
+        train_mask = (target_month < m) & panel[target_col].notna()
         train = panel.loc[train_mask]
         eval_row = panel.loc[(pm == m) & panel[target_col].notna()]
         if eval_row.empty or train.empty:
@@ -343,6 +376,7 @@ def _train_one(
     log_to_mlflow: bool,
     artifact_root: Path,
     feature_table_path: str,
+    horizon_months: int = 1,
 ) -> VersionResult:
     model_name = model_cfg["name"]
     version = version_cfg["name"]
@@ -355,13 +389,17 @@ def _train_one(
     artifact_dir = artifact_root / version / model_name
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    # Leak-safe filter ONLY for training data — the test set lives
-    # outside the cutoff (we need its labels for evaluation, but the
-    # model never sees them during fit). This mirrors a real backtest:
-    # in production at end-of-2021 we wouldn't have 2022 yet, but in
-    # retrospect we can score the v1 model against the 2022 labels we
-    # eventually observed.
-    panel_train_pool = filter_to_cutoff(panel, data_cutoff_month=cutoff)
+    # Leak-safe filter ONLY for training data. Two layers of "future":
+    #   1) row's features (period_month) must be observable at cutoff
+    #   2) row's TARGET (period_month + horizon) must also be observable
+    #      at cutoff — otherwise the label itself is a future leak
+    #      (e.g. for horizon=1 monthly, the row at period_month=cutoff
+    #      has target = SMP(cutoff+1) which doesn't exist yet at the
+    #      simulated retraining moment).
+    # Passing horizon_months>0 enforces both.
+    panel_train_pool = filter_to_cutoff(
+        panel, data_cutoff_month=cutoff, horizon_months=horizon_months,
+    )
 
     n_train_pool = int((pd.to_datetime(panel_train_pool["period_month"]) <= train_end).sum())
     min_train = int(model_cfg.get("min_train_rows", 0))
@@ -419,13 +457,17 @@ def _train_one(
             )
             n_train, n_test = len(train_df), len(test_df)
         elif eval_mode == "latest_rolling_validation":
-            # Only past data needed — stay on the leak-safe pool.
+            # Only past data needed — pass the FULL panel so the rolling
+            # window can see eval-month rows (period_month==m); the
+            # rolling function itself filters training by
+            # `period_month + horizon < m` per fold for strict leak-safety.
             window = int(version_cfg.get("rolling_window_months", 12))
             preds, metrics = _evaluate_latest_rolling_validation(
-                MODEL_FACTORIES[model_name], panel_train_pool,
+                MODEL_FACTORIES[model_name], panel,
                 target_col=target_col,
                 data_cutoff_month=cutoff,
                 window_months=window,
+                horizon_months=horizon_months,
             )
             n_train, n_test = n_train_pool, len(preds)
         else:
@@ -762,6 +804,7 @@ def run_smoke_test(
     target_cfg = cfg["target"]
     feature_table_path = target_cfg["feature_table"]
     target_col = target_cfg["target_column"]
+    horizon_months = int(target_cfg.get("horizon_months", 1))
     panel = pd.read_parquet(feature_table_path)
 
     versions = cfg["versions"]
@@ -783,6 +826,7 @@ def run_smoke_test(
                 target_col=target_col, log_to_mlflow=log_to_mlflow,
                 artifact_root=artifact_root,
                 feature_table_path=feature_table_path,
+                horizon_months=horizon_months,
             )
             results.append(result)
 
