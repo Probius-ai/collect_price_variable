@@ -217,27 +217,11 @@ def test_v5_uses_latest_rolling_validation_when_no_future_holdout(
         assert v5[col].isna().all() or (v5[col] == "None").all() or (v5[col] == "").all()
 
 
-def test_overlay_summary_run_encodes_model_name_into_metric_keys():
-    """Pin the data shape that makes MLflow overlay N models on one chart.
-
-    The overlay helper must:
-      * emit ONE summary run (not N), since the user wants every model
-        overlaid in the same Metrics tab
-      * encode the model name into the metric key as `{metric}__{model}`,
-        so MLflow treats each model's series as a distinct line
-      * log per-version values at `step=N` (from "vN") so the x-axis is
-        version-ordered
-      * NEVER emit a step value for a skipped (version, model) — that
-        would inject a hole in the line where there isn't really a value
-    """
-    from src.pipelines.mlops_smoke_test import (
-        _log_overlay_summary_run, VersionResult,
-    )
-    from unittest.mock import patch
-    from contextlib import contextmanager
-
-    # Two models × three versions. v3 of ridge is skipped.
-    results = [
+def _make_results_fixture():
+    """Two models × three versions. v3 of ridge is skipped. Shared by
+    the per-model and overview canaries."""
+    from src.pipelines.mlops_smoke_test import VersionResult
+    return [
         VersionResult(
             version="v1", model_name="ridge", data_cutoff_month="2021-12-01",
             train_end="2021-12-01", test_start="2022-01-01", test_end="2022-12-01",
@@ -277,69 +261,137 @@ def test_overlay_summary_run_encodes_model_name_into_metric_keys():
         ),
     ]
 
+
+def _patch_mlflow_run():
+    """Return (recorders_list, context_manager_replacement) so a test
+    can capture every log_* call without a live MLflow server."""
+    from contextlib import contextmanager
+
     class _RecorderRun:
         def __init__(self):
-            self.run_id = "fake-overlay-id"
+            self.run_id = f"fake-id-{id(self)}"
             self.params: dict = {}
             self.metrics_calls: list[tuple[dict, int | None]] = []
+            self.artifacts: list[tuple[str, str | None]] = []
+            self.tags: dict = {}
         def log_params(self, p): self.params.update(p)
         def log_metrics(self, m, step=None): self.metrics_calls.append((dict(m), step))
         def log_metric(self, k, v, step=None): self.metrics_calls.append(({k: v}, step))
-        def set_tag(self, *a, **k): pass
-        def set_tags(self, *a, **k): pass
-        def log_artifact(self, *a, **k): pass
+        def set_tag(self, k, v): self.tags[k] = v
+        def set_tags(self, t): self.tags.update(t)
+        def log_artifact(self, path, artifact_path=None):
+            self.artifacts.append((str(path), artifact_path))
 
     recorders: list[_RecorderRun] = []
 
     @contextmanager
     def _fake_run(*, enable=None, run_name=None, tags=None, nested=False):
         r = _RecorderRun()
+        if tags:
+            r.tags.update(tags)
+        r.run_name = run_name
         recorders.append(r)
         yield r
 
-    with patch("src.pipelines.mlops_smoke_test.maybe_mlflow_run", _fake_run):
-        rid = _log_overlay_summary_run(results=results, log_to_mlflow=True)
+    return recorders, _fake_run
 
-    # EXACTLY ONE summary run (no per-model split)
-    assert len(recorders) == 1, (
-        f"Expected exactly one overlay summary run, got {len(recorders)}"
+
+def test_per_model_summary_runs_emit_clean_metric_keys():
+    """The canonical MLflow shape: one run per model, with metric keys
+    `mae`/`rmse`/… (NOT prefixed by the model name).
+
+    Why this matters: MLflow's Compare-runs view auto-colour-codes by
+    RUN. Multiple metric keys in a single run share the default palette
+    colour and become visually indistinguishable. Per-model runs let
+    MLflow assign one distinct colour per model line out of the box.
+    """
+    from unittest.mock import patch
+    from src.pipelines.mlops_smoke_test import _log_per_model_summary_runs
+
+    results = _make_results_fixture()
+    recorders, fake_run = _patch_mlflow_run()
+
+    with patch("src.pipelines.mlops_smoke_test.maybe_mlflow_run", fake_run):
+        ids = _log_per_model_summary_runs(results=results, log_to_mlflow=True)
+
+    # One summary run per distinct model name
+    assert len(recorders) == 2, f"expected 2 per-model runs, got {len(recorders)}"
+    assert set(ids.keys()) == {"ridge", "persistence_monthly"}
+
+    # Each run's run_name = `summary_<model_name>`
+    run_names = {r.run_name for r in recorders}
+    assert run_names == {"summary_ridge", "summary_persistence_monthly"}
+
+    # Tags include the model_name so the Compare-runs filter can scope
+    for r in recorders:
+        assert r.tags.get("summary") == "true"
+        assert r.tags.get("kind") == "per_model"
+        assert r.tags.get("model_name") in {"ridge", "persistence_monthly"}
+
+    # Metric keys are CLEAN (mae / rmse) — NOT prefixed
+    for r in recorders:
+        for payload, _step in r.metrics_calls:
+            for key in payload:
+                assert "__" not in key, (
+                    f"metric key {key!r} carries a `__model` suffix; should "
+                    "be clean (`mae`, `rmse`, …) so MLflow Compare can "
+                    "auto-colour-code by run instead."
+                )
+
+    # Skipped v3 of ridge produces no log_metrics call at step=3
+    ridge_rec = next(r for r in recorders
+                     if r.tags.get("model_name") == "ridge")
+    ridge_steps = [step for _, step in ridge_rec.metrics_calls]
+    assert 3 not in ridge_steps, (
+        f"skipped v3/ridge leaked into per-model summary; steps={ridge_steps}"
     )
-    assert rid == "fake-overlay-id"
+
+
+def test_per_model_summary_runs_noop_when_logging_disabled():
+    """Pure UI helper — no work when MLflow logging is off."""
+    from src.pipelines.mlops_smoke_test import _log_per_model_summary_runs
+    assert _log_per_model_summary_runs(results=[], log_to_mlflow=False) == {}
+
+
+def test_overview_summary_run_attaches_overlay_chart_artifacts(tmp_path):
+    """The overview run carries NO metrics — just pre-rendered overlay
+    chart artifacts (PNG + HTML) under `overlay_charts/`. Gives the
+    user a one-click viewing path without needing the Compare gesture.
+    """
+    from unittest.mock import patch
+    from src.pipelines.mlops_smoke_test import _log_overview_summary_run
+
+    results = _make_results_fixture()
+    recorders, fake_run = _patch_mlflow_run()
+
+    with patch("src.pipelines.mlops_smoke_test.maybe_mlflow_run", fake_run):
+        rid = _log_overview_summary_run(results=results, log_to_mlflow=True)
+
+    assert len(recorders) == 1, "overview must emit exactly one run"
     rec = recorders[0]
+    assert rec.run_name == "summary_overview_v1_v5"
+    assert rec.tags.get("summary") == "true"
+    assert rec.tags.get("kind") == "overview"
 
-    # Two log_metrics calls — one per version (v1 + v2). v3 had only
-    # ridge and ridge was skipped → payload empty → no log call.
-    assert len(rec.metrics_calls) == 2, rec.metrics_calls
-    steps = sorted(call[1] for call in rec.metrics_calls)
-    assert steps == [1, 2], f"expected step=1,2; got {steps}"
+    # No metric logging — artifacts only
+    assert rec.metrics_calls == [], rec.metrics_calls
 
-    # Each step's payload encodes BOTH models' metric values under
-    # `{metric}__{model}` keys → MLflow overlays them as 2 lines.
-    expected_v1_keys = {
-        "mae__ridge", "rmse__ridge",
-        "mae__persistence_monthly", "rmse__persistence_monthly",
-    }
-    expected_v2_keys = expected_v1_keys  # same models, same metrics
-    actual_keys_per_step = {step: set(m.keys()) for m, step in rec.metrics_calls}
-    assert actual_keys_per_step[1] == expected_v1_keys, actual_keys_per_step[1]
-    assert actual_keys_per_step[2] == expected_v2_keys, actual_keys_per_step[2]
-
-    # The skipped v3-of-ridge MUST NOT appear in any key — no
-    # `mae__ridge` at step=3
-    for payload, step in rec.metrics_calls:
-        if step == 3:
-            assert "mae__ridge" not in payload, (
-                "skipped v3/ridge leaked into overlay run"
-            )
+    # PNG artifact per metric (we have 2 metrics: mae + rmse) under
+    # the `overlay_charts/` subdir. HTML may or may not exist depending
+    # on whether plotly is importable — at minimum the PNGs must.
+    png_artifacts = [
+        a for (a, sub) in rec.artifacts
+        if a.endswith(".png") and sub == "overlay_charts"
+    ]
+    assert len(png_artifacts) >= 2, (
+        f"expected >= 2 PNG overlay charts under overlay_charts/, "
+        f"got {png_artifacts}"
+    )
 
 
-def test_overlay_summary_run_noop_when_logging_disabled():
-    """When MLflow logging is off, no summary run is emitted — pure UI
-    helper, never load-bearing."""
-    from src.pipelines.mlops_smoke_test import _log_overlay_summary_run
-
-    rid = _log_overlay_summary_run(results=[], log_to_mlflow=False)
-    assert rid is None
+def test_overview_summary_run_noop_when_logging_disabled():
+    from src.pipelines.mlops_smoke_test import _log_overview_summary_run
+    assert _log_overview_summary_run(results=[], log_to_mlflow=False) is None
 
 
 def test_v5_rolling_validation_never_scores_target_beyond_cutoff(
