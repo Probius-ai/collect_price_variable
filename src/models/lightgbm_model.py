@@ -167,6 +167,13 @@ class LightGBMModel:
         self.early_stopping_rounds = early_stopping_rounds
         self.booster: lgb.Booster | None = None
         self.used_features: list[str] = []
+        # Filled in `fit()` when a validation set is supplied. Schema:
+        #   {dataset_name: {metric_name: [value_at_iter_0, ...]}}
+        # E.g. {'train': {'rmse': [...]}, 'valid': {'rmse': [...]}}
+        # Used by the MLOps smoke test to log proper per-iteration
+        # learning curves to MLflow (vs the single end-of-fit point that
+        # non-iterative models produce).
+        self.eval_history: dict[str, dict[str, list[float]]] = {}
 
     def _select_features(self, X: pd.DataFrame) -> list[str]:
         if self.feature_cols is not None:
@@ -247,6 +254,11 @@ class LightGBMModel:
         if X_valid is not None:
             callbacks.append(lgb.early_stopping(self.early_stopping_rounds, verbose=False))
         callbacks.append(lgb.log_evaluation(period=0))
+        # Capture per-iteration metrics so the MLOps smoke test can log
+        # them to MLflow as a learning curve. Reset between fits so a
+        # second `.fit()` doesn't pile onto stale data.
+        self.eval_history = {}
+        callbacks.append(lgb.record_evaluation(self.eval_history))
         self.booster = lgb.train(
             self.params,
             train_set,

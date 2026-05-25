@@ -271,7 +271,26 @@ def _evaluate_fixed_holdout(
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     X_train = _drop_leakage_columns(train, target_col)
     y_train = train[target_col].astype(float)
-    model.fit(X_train, y_train)
+    # Hand the validation set into fit() for models that support it.
+    # LightGBM uses it for (a) early stopping and (b) populating its
+    # per-iteration `eval_history`, which the smoke test then logs as
+    # a learning curve. Non-iterative models silently ignore the
+    # extra kwargs (they don't accept them) — guard with introspection.
+    import inspect
+    fit_params = inspect.signature(model.fit).parameters
+    X_test_for_fit = (
+        _drop_leakage_columns(test, target_col)
+        if (not test.empty and "X_valid" in fit_params)
+        else None
+    )
+    if X_test_for_fit is not None:
+        model.fit(
+            X_train, y_train,
+            X_valid=X_test_for_fit,
+            y_valid=test[target_col].astype(float),
+        )
+    else:
+        model.fit(X_train, y_train)
 
     if test.empty:
         return pd.DataFrame(columns=["period_month", "y_true", "y_pred"]), {}
@@ -286,6 +305,43 @@ def _evaluate_fixed_holdout(
     })
     metrics = compute_metrics(y_true, y_pred)
     return preds, _metrics_to_dict(metrics)
+
+
+def _extract_learning_curve(model: Any) -> dict[str, list[float]] | None:
+    """Pull a per-iteration metric history out of a fitted model.
+
+    Returns ``{metric_name: [values_per_iter]}`` for models that have
+    such a history (LightGBM after fit-with-validation; sklearn MLP via
+    ``loss_curve_``). Returns ``None`` for models without an epoch
+    concept (Ridge, persistence, naive baselines) — those converge in
+    one shot and only have a final test metric, no curve to draw.
+
+    The smoke test logs whatever this returns to the MLflow run as a
+    stepped metric series so the run's Metrics tab renders it as an
+    actual learning curve instead of a single point.
+    """
+    # LightGBM family — eval_history is populated by lgb.record_evaluation
+    history = getattr(model, "eval_history", None)
+    if isinstance(history, dict) and history:
+        # eval_history shape: {dataset_name: {metric_name: [vals]}}
+        # Prefer the 'valid' bucket; fall back to 'train' if no valid was passed.
+        for dataset_name in ("valid", "train"):
+            if dataset_name in history and history[dataset_name]:
+                return {k: list(v) for k, v in history[dataset_name].items()}
+
+    # sklearn MLPRegressor exposes loss_curve_ — fitted training loss
+    # per iteration. Not a holdout metric, but still a learning curve.
+    if hasattr(model, "loss_curve_"):
+        try:
+            return {"train_loss": list(model.loss_curve_)}
+        except Exception:
+            pass
+    # Some wrappers (DeltaLightGBM etc.) hold the inner model
+    inner = getattr(model, "base_model", None) or getattr(model, "model", None)
+    if inner is not None and inner is not model:
+        return _extract_learning_curve(inner)
+
+    return None
 
 
 def _evaluate_latest_rolling_validation(
@@ -532,6 +588,13 @@ def _train_one(
         "feature_table_path": feature_table_path,
     }
 
+    # Capture a per-iteration learning curve if the model exposes one
+    # (LightGBM family via `eval_history`, MLP via `loss_curve_`). Models
+    # without epochs return None — those runs just have a single final
+    # metric point, which is the honest "this model converges in one shot"
+    # representation.
+    learning_curve = _extract_learning_curve(model)
+
     mlflow_run_id: str | None = None
     with maybe_mlflow_run(
         enable=log_to_mlflow,
@@ -541,10 +604,39 @@ def _train_one(
             "kind": model_cfg.get("kind"),
             "smoke_test": "v1_v5",
             "evaluation_mode": eval_mode,
+            "has_learning_curve": "true" if learning_curve else "false",
         },
     ) as run:
         run.log_params(params)
-        run.log_metrics(metrics)
+
+        # Log per-iteration learning curve as stepped metrics so MLflow's
+        # Metrics tab renders the convergence line. Curve keys keep
+        # their natural name (e.g. `rmse`); FINAL test-set metrics get
+        # a `_test` suffix to avoid collision at step=0 with the curve's
+        # first iteration.
+        if learning_curve:
+            for metric_name, values in learning_curve.items():
+                for step, value in enumerate(values):
+                    try:
+                        v = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if v != v:  # NaN check
+                        continue
+                    run.log_metric(metric_name, v, step=step)
+            run.log_params({
+                "learning_curve_metrics": ",".join(sorted(learning_curve.keys())),
+                "learning_curve_n_iters": max(len(v) for v in learning_curve.values()),
+            })
+            # Final holdout metrics under `_test` suffix — coexists
+            # cleanly with the curve, so the user can see both
+            # "convergence during training" and "final score" without
+            # MLflow's last-write-wins overwriting either.
+            run.log_metrics({f"{k}_test": v for k, v in metrics.items()})
+        else:
+            # Non-iterative model — single final point at default step.
+            run.log_metrics(metrics)
+
         if preds_path.exists():
             run.log_artifact(preds_path)
         run.log_artifact(metrics_path)

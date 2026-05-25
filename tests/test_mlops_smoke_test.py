@@ -394,6 +394,54 @@ def test_overview_summary_run_noop_when_logging_disabled():
     assert _log_overview_summary_run(results=[], log_to_mlflow=False) is None
 
 
+def test_extract_learning_curve_handles_lightgbm_and_non_iterative_models():
+    """Pin the contract of `_extract_learning_curve`:
+
+    - LightGBM (fit with X_valid set) → returns `{metric_name: [values]}`
+      pulled from `eval_history['valid']`. This is the per-iteration
+      learning curve MLflow needs to render as a line chart instead of
+      a single point.
+    - Models without an epoch concept (Ridge, PersistenceMonthly) →
+      returns None. We don't fabricate a curve for them.
+    """
+    import numpy as np, pandas as pd
+    from src.pipelines.mlops_smoke_test import _extract_learning_curve
+    from src.models.lightgbm_model import LightGBMModel
+    from src.models.ridge_model import RidgeModel
+    from src.models.naive import PersistenceMonthly
+
+    # Synthetic monthly panel — enough rows for LightGBM to actually fit
+    rng = np.random.default_rng(0)
+    n = 60
+    X_train = pd.DataFrame({
+        "smp_t_observed": rng.normal(100, 10, n),
+        "smp_lag_1m":     rng.normal(100, 10, n),
+        "smp_lag_2m":     rng.normal(100, 10, n),
+    })
+    y_train = pd.Series(rng.normal(100, 10, n))
+    X_valid = X_train.iloc[:12].copy()
+    y_valid = y_train.iloc[:12].copy()
+
+    # LightGBM with validation set → eval_history populated → curve returned
+    lgb_model = LightGBMModel(num_boost_round=20, early_stopping_rounds=50)
+    lgb_model.fit(X_train, y_train, X_valid=X_valid, y_valid=y_valid)
+    curve = _extract_learning_curve(lgb_model)
+    assert curve is not None, "LightGBM with X_valid must return a curve"
+    assert isinstance(curve, dict)
+    # rmse is the default `metric` param — should be a list ≥ 1 long
+    assert any(len(v) >= 1 for v in curve.values()), curve
+
+    # Ridge — no epochs, no curve
+    ridge = RidgeModel().fit(X_train, y_train)
+    assert _extract_learning_curve(ridge) is None, (
+        "Ridge converges in one shot — must not fabricate a fake curve."
+    )
+
+    # Persistence — pure lookup, no fit work
+    persistence = PersistenceMonthly().fit(X_train, y_train)
+    assert _extract_learning_curve(persistence) is None
+
+
 def test_v5_rolling_validation_never_scores_target_beyond_cutoff(
     synthetic_panel: Path, tmp_path: Path,
 ):
