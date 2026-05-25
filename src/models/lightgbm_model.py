@@ -74,6 +74,11 @@ DEFAULT_LGB_FEATURES_MONTHLY = [
     "lng_price_usd_per_mmbtu_lag_1m",
     "lng_price_usd_per_mmbtu_lag_2m",
     "lng_price_chg_1m_lag_1m",
+    # JKM daily-derived monthly volatility (round 8).
+    "jkm_daily_mean_lag_1m",
+    "jkm_daily_std_lag_1m",
+    "jkm_daily_range_lag_1m",
+    "jkm_daily_last_lag_1m",
     # Settlement (lag_1m, full canonical fuel set)
     "settlement_unit_price_coal_anthracite_lag_1m",
     "settlement_unit_price_coal_bituminous_lag_1m",
