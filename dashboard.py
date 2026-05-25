@@ -351,6 +351,7 @@ st.caption(
 page = st.sidebar.radio(
     "Page",
     [
+        "0. 모델 선정 (Solar → SMP)",
         "1. Overview",
         "2. Models",
         "3. Predictions",
@@ -365,10 +366,325 @@ page = st.sidebar.radio(
 )
 
 # ---------------------------------------------------------------------------
+# Force-retrain helper (used by Page 0's bottom-right button)
+# ---------------------------------------------------------------------------
+#
+# The smoke-test pipeline takes ~5-10 min end-to-end (LightGBM + rolling
+# v5 are the slow parts). We can't block the Streamlit script for that
+# long, so we fire-and-forget a subprocess and stash a status marker on
+# disk that the page re-reads on every rerun.
+
+RETRAIN_LOCK = ROOT / "outputs" / "_retrain_status.json"
+
+
+def _retrain_status() -> dict | None:
+    if not RETRAIN_LOCK.exists():
+        return None
+    try:
+        return json.loads(RETRAIN_LOCK.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _retrain_pid_alive(pid: int | None) -> bool:
+    """True iff the recorded subprocess PID is still in the process table."""
+    if not pid:
+        return False
+    try:
+        import os, errno
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError as e:
+        import errno
+        return e.errno != errno.ESRCH
+
+
+def _trigger_force_retrain() -> dict:
+    """Launch the MLOps smoke test in the background and persist the
+    status marker. Returns the new status dict.
+
+    Wired so that:
+      * MLFLOW_TRACKING_URI is propagated (so the run lands on the
+        already-running local MLflow server, no separate Docker step).
+      * --log-to-mlflow is forced on (the whole point of the button is
+        to populate MLflow).
+      * Output goes to outputs/_retrain.log so the operator can tail it.
+    """
+    import os, subprocess
+    from datetime import datetime, timezone
+
+    log_path = ROOT / "outputs" / "_retrain.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_f = log_path.open("w", encoding="utf-8")
+    env = {
+        **os.environ,
+        "MLFLOW_TRACKING_URI": os.environ.get(
+            "MLFLOW_TRACKING_URI", "http://localhost:5000"
+        ),
+        "MLFLOW_EXPERIMENT_NAME": os.environ.get(
+            "MLFLOW_EXPERIMENT_NAME", "kpx-smp-monthly"
+        ),
+        "ENABLE_MLFLOW": "true",
+    }
+    cmd = [
+        str(ROOT / ".venv" / "bin" / "python"),
+        "-m", "src.pipelines.mlops_smoke_test",
+        "--config", str(ROOT / "config" / "mlops_smoke_test.yaml"),
+        "--log-to-mlflow",
+    ]
+    proc = subprocess.Popen(
+        cmd, stdout=log_f, stderr=subprocess.STDOUT, cwd=str(ROOT),
+        env=env, start_new_session=True,
+    )
+    status = {
+        "pid": proc.pid,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "trigger": "force_retrain_button",
+        "log_path": str(log_path.relative_to(ROOT)),
+        "mlflow_uri": env["MLFLOW_TRACKING_URI"],
+    }
+    RETRAIN_LOCK.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Page 0: 모델 선정 (Solar → SMP) — landing / decision page
+# ---------------------------------------------------------------------------
+
+if page == "0. 모델 선정 (Solar → SMP)":
+    st.header("⚡ 모델 선정 — 단기 태양광 발전량 예측을 통한 전력 가격 모델")
+    st.caption(
+        "이 페이지는 v1~v5 staged-retraining 결과를 한 화면으로 모아서 "
+        "**production에 올릴 모델 1개를 고르는 의사결정**을 돕는 뷰입니다. "
+        "각 섹션은 깊은 분석이 가능한 사이드바의 다른 페이지로 연결됩니다."
+    )
+
+    COMPARISON_CSV = ROOT / "outputs/metrics/mlops_version_comparison.csv"
+    REGISTRY_DIR = ROOT / "outputs/model_registry"
+
+    if not COMPARISON_CSV.exists():
+        st.warning(
+            "비교 데이터가 없습니다. 사이드바의 우하단 **강제 재학습** 버튼을 "
+            "누르거나, 터미널에서 "
+            "`python -m src.pipelines.mlops_smoke_test "
+            "--config config/mlops_smoke_test.yaml --log-to-mlflow` 를 "
+            "실행해 주세요."
+        )
+    else:
+        cmp = pd.read_csv(COMPARISON_CSV)
+        cmp_clean = cmp[cmp["skipped"] != True].copy()  # noqa: E712
+
+        # -- Decision panel ---------------------------------------------
+        rec_row = cmp_clean[cmp_clean["registry_status"] == "recommended_historical"]
+        latest_rows = cmp_clean[cmp_clean["registry_status"] == "latest_candidate"]
+        # Best latest_candidate = lowest MAE among v5 entries
+        best_latest = (
+            latest_rows.sort_values("mae").iloc[0]
+            if not latest_rows.empty else None
+        )
+        persistence_v5 = latest_rows[latest_rows["model"] == "persistence_monthly"]
+        baseline_mae = (
+            float(persistence_v5["mae"].iloc[0])
+            if not persistence_v5.empty else None
+        )
+
+        st.subheader("의사결정 패널")
+        st.caption(
+            "MAE 기준. 추천 모델은 (1) v1~v4 holdout 평균 우수 + (2) v5 rolling "
+            "검증에서도 안정적인 것을 우선합니다."
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        if not rec_row.empty:
+            r = rec_row.iloc[0]
+            c1.metric(
+                "추천 모델 (v1~v4 best)",
+                str(r["model"]),
+                help=f"version={r['version']}, evaluation_mode={r['evaluation_mode']}",
+            )
+            c2.metric("Test MAE", f"{float(r['mae']):.3f}")
+        if best_latest is not None:
+            c3.metric(
+                "v5 latest candidate",
+                str(best_latest["model"]),
+                f"{float(best_latest['mae']):.3f} MAE",
+                help="2025-08 cutoff, 12-month rolling validation",
+            )
+        if baseline_mae is not None and best_latest is not None:
+            improvement = baseline_mae - float(best_latest["mae"])
+            c4.metric(
+                "vs Persistence (v5)",
+                f"{improvement:+.3f} MAE",
+                f"{(improvement / baseline_mae * 100):+.1f} %",
+                help=f"Persistence baseline MAE at v5 = {baseline_mae:.3f}",
+            )
+
+        # -- Stability + ranking table ----------------------------------
+        st.subheader("후보 모델 안정성 (v4 → v5 변화)")
+        st.caption(
+            "v4는 fixed-holdout (forward labels 있음), v5는 rolling validation "
+            "(future labels 없음). 두 점수 차이가 작을수록 **새 데이터가 들어와도 "
+            "성능이 흔들리지 않는** 모델."
+        )
+        v4 = cmp_clean[cmp_clean["version"] == "v4"].set_index("model")[["mae"]]
+        v5 = cmp_clean[cmp_clean["version"] == "v5"].set_index("model")[["mae"]]
+        v4.columns = ["v4_holdout_mae"]
+        v5.columns = ["v5_rolling_mae"]
+        stab = v4.join(v5, how="inner").reset_index()
+        stab["delta_v5_minus_v4"] = (stab["v5_rolling_mae"] - stab["v4_holdout_mae"]).round(3)
+        stab["mean_v4_v5_mae"] = ((stab["v4_holdout_mae"] + stab["v5_rolling_mae"]) / 2).round(3)
+        stab = stab.sort_values("mean_v4_v5_mae").reset_index(drop=True)
+
+        def _highlight_row(row):
+            colour = ""
+            if row["model"] == (rec_row.iloc[0]["model"] if not rec_row.empty else None):
+                colour = "background-color: #d4edda;"
+            elif best_latest is not None and row["model"] == best_latest["model"]:
+                colour = "background-color: #d1ecf1;"
+            return [colour] * len(row)
+
+        st.dataframe(
+            stab.round(3).style.apply(_highlight_row, axis=1),
+            width="stretch", hide_index=True,
+        )
+        st.caption(
+            "🟢 = recommended_historical (v1~v4 best) · "
+            "🔵 = v5 latest_candidate (best). 두 모델이 일치하면 그 모델이 "
+            "가장 강한 후보입니다."
+        )
+
+        # -- Why Solar matters ------------------------------------------
+        with st.expander(
+            "🌞  왜 단기 태양광 예측이 SMP 모델 선정에 중요한가",
+            expanded=False,
+        ):
+            st.markdown("""
+한국 전력시장의 SMP(System Marginal Price)는 마지막에 호출된
+**한계 발전기의 변동비**가 결정합니다. 일반적으로 한계 발전기는 LNG 화력이고,
+LNG는 가격 변동이 큰 연료입니다. 따라서:
+
+```
+↑ 단기 태양광 발전량 예측
+        ↓
+↓ LNG 화력 호출량 (재생에너지가 우선 송전)
+        ↓
+↓ LNG 수요·도입가 충격 가능성
+        ↓
+↓ SMP (특히 일간/시간대별)
+```
+
+**모델 선정 관점에서**:
+- 단기 (수 시간) 태양광 예측이 정확할수록 LNG 콜이 줄어드는 시간대를 미리 알 수 있고,
+  그만큼 SMP 예측의 분산이 줄어듭니다.
+- 본 워크스페이스는 월간 SMP 모델을 후보로 갖고 있고, 태양광은 외부
+  `solar/` 모델 (별도 PV 모델군)이 처리합니다 — Round 6/7에서 **LNG 가격
+  예측을 SMP feature로 통합**한 결과(`docs/figures/baseline_post_lng_v2_leakfix/`)를
+  비교한 것이 그 첫걸음입니다.
+- 따라서 추천 기준은 단순 MAE 최저가 아니라
+  **(a) 안정성 (v5 rolling 검증 강건) + (b) 외부 LNG·날씨 신호에 반응하는 구조**
+  입니다.
+            """)
+
+        # -- External solar/LNG model inventory -------------------------
+        st.subheader("외부 모델 인벤토리 (Solar / LNG)")
+        ext = []
+        for label, path, kind in [
+            ("Solar PV — 외부 모델군", ROOT / "solar", "directory"),
+            ("Solar-beam — 기상 기반 발전량", ROOT / "solar_beam", "directory"),
+            ("LNG 가격 예측 (round 7)", ROOT / "outputs/lng_forecast", "directory"),
+            ("외부 모델 인벤토리 문서", ROOT / "docs/external_models_inventory.md", "file"),
+        ]:
+            present = path.exists()
+            ext.append({
+                "리소스": label,
+                "경로": str(path.relative_to(ROOT)) if present else "—",
+                "상태": "✅ 있음" if present else "❌ 없음",
+                "유형": kind,
+            })
+        st.dataframe(pd.DataFrame(ext), width="stretch", hide_index=True)
+
+        # -- Deep-dive jump links ---------------------------------------
+        st.subheader("더 깊이 들어가려면")
+        c1, c2, c3 = st.columns(3)
+        c1.info(
+            "**모델 성능 표** — Page 2 Models\n\n"
+            "comparison.csv 기반 MAE/RMSE/MAPE/R²/directional_accuracy 전체."
+        )
+        c2.info(
+            "**예측 vs 실측 시계열** — Page 3 Predictions\n\n"
+            "선택한 모델의 forecast_origin / target_month 호버 포함."
+        )
+        c3.info(
+            "**Walk-forward CV** — Page 6\n\n"
+            "test split이 아닌 매월 refit하며 본 production-like 성능."
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.info(
+            "**LNG 통합 효과** — Page 7\n\n"
+            "Round 6 leakage fix 전·후, Round 8 JKM 추가 3-way 비교."
+        )
+        c2.info(
+            "**LNG 단독 예측 모델** — Page 8\n\n"
+            "PDF 가이드 기반 LightGBM/MLP/naive 비교."
+        )
+        c3.info(
+            "**MLOps v1~v5 상세** — Page 10\n\n"
+            "각 cutoff별 모델 등록 + JSON registry."
+        )
+
+        # -- Bottom row: force-retrain button + 6-hour auto-retrain note
+        st.markdown("---")
+        st.markdown("")  # spacer
+
+        note_col, btn_col = st.columns([3, 1])
+        with note_col:
+            st.caption(
+                "ℹ️ **모델은 6시간마다 단기 예보 정보를 통해 자동 재학습됩니다.** "
+                "수동으로 즉시 새 학습을 돌리려면 오른쪽 버튼을 누르세요. "
+                "백그라운드에서 v1~v5 smoke test가 실행되며 MLflow에 자동 기록됩니다 "
+                "(보통 5~10분 소요)."
+            )
+        with btn_col:
+            if st.button("🔄 강제 재학습", type="primary", width="stretch"):
+                current = _retrain_status()
+                if current and _retrain_pid_alive(current.get("pid")):
+                    st.warning(
+                        f"이미 재학습이 진행 중입니다 (PID {current['pid']}, "
+                        f"시작 {current['started_at'][:19]})."
+                    )
+                else:
+                    new_status = _trigger_force_retrain()
+                    st.success(
+                        f"재학습 시작 (PID {new_status['pid']}). 페이지를 새로고침하면 진행 상태가 업데이트됩니다."
+                    )
+
+        # Status display (always visible if a marker exists)
+        status = _retrain_status()
+        if status:
+            alive = _retrain_pid_alive(status.get("pid"))
+            ts = status.get("started_at", "?")[:19]
+            if alive:
+                st.info(
+                    f"🟡 재학습 진행 중 — PID {status['pid']}, "
+                    f"started {ts} (UTC). "
+                    f"진행 로그: `{status.get('log_path', '-')}`. "
+                    f"완료 시 MLflow ({status.get('mlflow_uri', '-')}) 의 "
+                    "`kpx-smp-monthly` experiment에 새 run 50개가 추가됩니다."
+                )
+            else:
+                st.success(
+                    f"🟢 최근 재학습 완료 — started {ts} (UTC). "
+                    "Page 10 또는 MLflow UI에서 새 결과를 확인하세요."
+                )
+
+
+# ---------------------------------------------------------------------------
 # Page 1: Overview
 # ---------------------------------------------------------------------------
 
-if page == "1. Overview":
+elif page == "1. Overview":
     st.header("Overview")
 
     col1, col2, col3, col4 = st.columns(4)
