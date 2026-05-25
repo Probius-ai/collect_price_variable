@@ -670,82 +670,212 @@ def _record_skip(
 # ---------------------------------------------------------------------------
 
 
-def _log_overlay_summary_run(
+def _build_overlay_chart_artifacts(
+    *, results: list[VersionResult], out_dir: Path,
+) -> list[Path]:
+    """Generate per-metric overlay line charts (one PNG + one HTML each).
+
+    Each chart plots all models as separate lines on a shared x-axis
+    (version step 1..N), so the user can compare every model's
+    trajectory across v1..v5 on a single visual. Generated as both:
+
+      * **PNG** (matplotlib) — stable, screenshot-friendly, renders in
+        MLflow's artifact preview, good for presentations.
+      * **HTML** (plotly) — interactive (hover for values, click legend
+        to toggle a series on/off), good for the dashboard / exploration.
+
+    Skipped (version, model) pairs are excluded so the line for that
+    model just has a gap at that step rather than a NaN spike.
+
+    Returns the list of generated file paths.
+    """
+    rows: list[dict[str, Any]] = []
+    for r in results:
+        if r.skipped or not r.metrics:
+            continue
+        step = int(r.version.lstrip("v"))
+        for metric_name, value in r.metrics.items():
+            rows.append({
+                "version": r.version, "step": step,
+                "model": r.model_name, "metric": metric_name,
+                "value": float(value),
+            })
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+
+    # Defer matplotlib + plotly imports until we actually have rows to
+    # plot — keeps the smoke-test import cost flat when MLflow logging
+    # is off (the common test-runner case).
+    import matplotlib
+    matplotlib.use("Agg")  # headless — no GUI backend even in interactive shells
+    import matplotlib.pyplot as plt
+    try:
+        import plotly.graph_objects as go
+        _HAS_PLOTLY = True
+    except ImportError:
+        _HAS_PLOTLY = False
+
+    for metric_name in sorted(df["metric"].unique()):
+        sub = df[df["metric"] == metric_name]
+        models_sorted = sorted(sub["model"].unique())
+
+        # ---- matplotlib PNG ----
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for model_name in models_sorted:
+            m_data = sub[sub["model"] == model_name].sort_values("step")
+            ax.plot(
+                m_data["step"], m_data["value"],
+                marker="o", label=model_name,
+            )
+        ax.set_title(f"{metric_name.upper()} by version — all models overlaid")
+        ax.set_xlabel("Version step (1=v1 … 5=v5)")
+        ax.set_ylabel(metric_name)
+        ax.set_xticks(sorted(sub["step"].unique()))
+        ax.legend(loc="best", fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        png_path = out_dir / f"overlay_{metric_name}.png"
+        fig.savefig(png_path, dpi=120)
+        plt.close(fig)
+        saved.append(png_path)
+
+        # ---- plotly HTML (interactive) ----
+        if _HAS_PLOTLY:
+            fig = go.Figure()
+            for model_name in models_sorted:
+                m_data = sub[sub["model"] == model_name].sort_values("step")
+                fig.add_trace(go.Scatter(
+                    x=m_data["version"], y=m_data["value"],
+                    mode="lines+markers", name=model_name,
+                ))
+            fig.update_layout(
+                title=f"{metric_name.upper()} by version — all models overlaid",
+                xaxis_title="version (data_cutoff retraining stage)",
+                yaxis_title=metric_name,
+                hovermode="x unified",
+                legend_title="model",
+            )
+            html_path = out_dir / f"overlay_{metric_name}.html"
+            fig.write_html(str(html_path))
+            saved.append(html_path)
+
+    return saved
+
+
+def _log_per_model_summary_runs(
+    *, results: list[VersionResult], log_to_mlflow: bool,
+) -> dict[str, str]:
+    """N runs (one per model). Each logs a clean metric series
+    (``mae``, ``rmse``, ``mape``, ``r2``, ``directional_accuracy``) at
+    step=1..5 corresponding to v1..v5.
+
+    Why this shape (over the prior single-overlay-run with ``mae__<model>``
+    keys): MLflow's Compare-runs view auto-colour-codes by RUN, not by
+    metric-key family. Multiple keys in one run share the default
+    palette colour and become visually indistinguishable. Per-model
+    runs let MLflow assign a distinct colour per model line out of the
+    box — the canonical "one run per training configuration" pattern.
+
+    Run naming: ``summary_<model_name>`` so the Runs table can filter
+    by tag ``summary=true`` AND by `model_name=…`.
+
+    Returns ``{model_name: run_id}``.
+    """
+    summary_ids: dict[str, str] = {}
+    if not log_to_mlflow:
+        return summary_ids
+
+    by_model: dict[str, list[VersionResult]] = {}
+    for r in results:
+        by_model.setdefault(r.model_name, []).append(r)
+
+    for model_name, runs in by_model.items():
+        runs_sorted = sorted(runs, key=lambda x: int(x.version.lstrip("v")))
+        with maybe_mlflow_run(
+            enable=True,
+            run_name=f"summary_{model_name}",
+            tags={
+                "summary": "true",
+                "kind": "per_model",
+                "model_name": model_name,
+                "smoke_test": "v1_v5",
+                "view_hint": (
+                    "To overlay every model on one chart: filter Runs by "
+                    "`tags.summary = 'true' AND tags.kind = 'per_model'`, "
+                    "select all, click Compare → Metric history. MLflow "
+                    "auto-colour-codes by run."
+                ),
+            },
+        ) as run:
+            run.log_params({
+                "model_name": model_name,
+                "summary_kind": "per_model",
+                "n_versions": len(runs_sorted),
+                "versions": ",".join(r.version for r in runs_sorted),
+            })
+            for r in runs_sorted:
+                if r.skipped or not r.metrics:
+                    continue
+                step = int(r.version.lstrip("v"))
+                # Clean metric names — `mae`, `rmse`, etc. NOT `mae__ridge`.
+                # MLflow then plots one series per metric per run, with
+                # the RUN providing the colour distinction across models.
+                run.log_metrics(r.metrics, step=step)
+            summary_ids[model_name] = run.run_id
+
+    return summary_ids
+
+
+def _log_overview_summary_run(
     *, results: list[VersionResult], log_to_mlflow: bool,
 ) -> str | None:
-    """Log ONE MLflow run that overlays every model's v1..v5 trajectory
-    on shared metric charts.
+    """ONE summary run with pre-rendered overlay chart artifacts attached.
 
-    MLflow's Run-detail Metrics tab plots distinct metric keys as
-    separate lines that overlay when selected together. If we encode
-    the model name INTO the metric key (e.g. ``mae__ridge``,
-    ``mae__lightgbm``, …) and log each at step=1..5, then opening the
-    Metrics tab and checking every ``mae__*`` checkbox gives N lines
-    on a single chart with x-axis = version.
-
-    Returns the run_id (or None when MLflow logging is disabled).
-
-    Naming convention: ``{metric_name}__{model_name}``. Double-
-    underscore is used so a model name containing a single underscore
-    (``naive_lag_1m``, ``monthly_ar_ridge``) still parses unambiguously
-    if a reader splits on ``__``.
+    No metrics logged (no Compare gymnastics needed) — just a clean
+    bucket for the matplotlib PNGs + plotly HTMLs the user can open
+    directly in the Artifacts tab. The per-model summary runs (above)
+    cover the interactive-comparison path; this run covers the
+    one-click "give me the screenshot" path.
     """
     if not log_to_mlflow:
         return None
 
-    # Numeric step ordering across versions
-    by_model: dict[str, list[VersionResult]] = {}
-    model_order: list[str] = []
-    for r in results:
-        if r.model_name not in by_model:
-            model_order.append(r.model_name)
-        by_model.setdefault(r.model_name, []).append(r)
-
     with maybe_mlflow_run(
         enable=True,
-        run_name="summary_overlay_v1_v5",
+        run_name="summary_overview_v1_v5",
         tags={
             "summary": "true",
-            "kind": "overlay",
+            "kind": "overview",
             "smoke_test": "v1_v5",
             "view_hint": (
-                "Open Metrics tab → check every `mae__*` (or rmse__*, "
-                "mape__*, r2__*) checkbox → MLflow overlays one line "
-                "per model on shared x-axis (step=version)."
+                "Open Artifacts tab → overlay_charts/ → click any "
+                "`overlay_<metric>.png` for a one-shot screenshot, or the "
+                "matching `.html` for an interactive Plotly chart."
             ),
         },
     ) as run:
-        # Get the set of metric names that any non-skipped result has
-        all_metric_names: set[str] = set()
-        for r in results:
-            if r.metrics and not r.skipped:
-                all_metric_names.update(r.metrics.keys())
-
         run.log_params({
-            "summary_kind": "overlay_all_models",
-            "n_models": len(by_model),
+            "summary_kind": "overview_artifacts_only",
+            "n_models": len({r.model_name for r in results}),
             "n_versions": len({r.version for r in results}),
-            "metric_keys_per_model": ",".join(sorted(all_metric_names)),
-            "models": ",".join(model_order),
         })
 
-        # Walk version-by-version so each step gets one log_metrics call.
-        # Group all (version, model) results by version, then within
-        # each version emit `{metric}__{model}` = value at that step.
-        by_version: dict[str, list[VersionResult]] = {}
-        for r in results:
-            by_version.setdefault(r.version, []).append(r)
-
-        for version in sorted(by_version, key=lambda v: int(v.lstrip("v"))):
-            step = int(version.lstrip("v"))
-            payload: dict[str, float] = {}
-            for r in by_version[version]:
-                if r.skipped or not r.metrics:
-                    continue
-                for metric_name, value in r.metrics.items():
-                    payload[f"{metric_name}__{r.model_name}"] = value
-            if payload:
-                run.log_metrics(payload, step=step)
+        import tempfile
+        chart_dir = Path(tempfile.mkdtemp(prefix="mlops_overlay_charts_"))
+        try:
+            chart_paths = _build_overlay_chart_artifacts(
+                results=results, out_dir=chart_dir,
+            )
+            for p in chart_paths:
+                run.log_artifact(p, artifact_path="overlay_charts")
+        except Exception as exc:
+            # Don't let a charting failure take down the smoke test —
+            # the per-model runs above are the load-bearing path.
+            log.warning("Could not generate overlay charts: %s", exc)
 
         return run.run_id
 
@@ -925,13 +1055,17 @@ def run_smoke_test(
             )
             results.append(result)
 
-    # After the 35 individual (version, model) runs, log ONE additional
-    # "overlay" summary run that records every model's v1..v5 metric
-    # trajectory under per-model metric keys (`mae__ridge`,
-    # `mae__lightgbm`, …). Selecting all `mae__*` checkboxes in that
-    # run's Metrics tab gives MLflow's native overlaid line chart with
-    # one line per model on shared x-axis.
-    _log_overlay_summary_run(results=results, log_to_mlflow=log_to_mlflow)
+    # Two summary layers on top of the 35 individual (version, model) runs:
+    #   1. PER-MODEL — one run per model with clean metric names (`mae`,
+    #      `rmse`, …) at step=1..5. MLflow's Compare-runs view auto-
+    #      colour-codes by run, so selecting all per-model summary runs
+    #      and clicking Compare → Metric history gives a clean overlay
+    #      with one colour per model. This is the canonical MLflow shape.
+    #   2. OVERVIEW — one run with pre-rendered overlay PNG + interactive
+    #      HTML chart artifacts attached. One-click viewing in the
+    #      Artifacts tab; no Compare gymnastics required.
+    _log_per_model_summary_runs(results=results, log_to_mlflow=log_to_mlflow)
+    _log_overview_summary_run(results=results, log_to_mlflow=log_to_mlflow)
 
     df = build_comparison_dataframe(results)
     df = _annotate_recommendations(
