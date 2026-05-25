@@ -59,6 +59,12 @@ htmlcov/
 .idea/
 *.swp
 
+# Streamlit local config is per-developer (LAN binding, CORS/XSRF
+# toggles, theme overrides, etc.) — committing it would force every
+# clone to inherit one developer's network-exposure choice. Ship the
+# safe-defaults sample at .streamlit/config.toml.example instead.
+.streamlit/config.toml
+
 data/raw/**/*.json
 data/raw/**/*.xml
 data/raw/**/*.csv

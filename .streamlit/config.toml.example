@@ -1,0 +1,65 @@
+# Streamlit configuration — SAFE DEFAULTS.
+#
+# Copy this file to `.streamlit/config.toml` and tune for your machine.
+# The destination is gitignored so each developer can pick their own
+# binding / CORS / XSRF posture without forcing it on the rest of the
+# team.
+#
+# Default posture below: localhost-only, all built-in protections ON.
+# Loopback binding is the safest setting for development workstations.
+
+[server]
+# Bind to loopback by default — only this machine can connect.
+# Change to "0.0.0.0" ONLY if you understand the implications below.
+address = "127.0.0.1"
+port = 8501
+
+# Don't try to open a browser window when launched (e.g. over SSH).
+headless = true
+
+# XSRF + CORS protections are ON by default. These are what stop
+# untrusted pages elsewhere on the same machine (or network, if bound
+# to 0.0.0.0) from initiating cross-site requests to your dashboard.
+# Disabling them only makes sense in combination with binding to a
+# trusted network — see the LAN section below.
+enableCORS = true
+enableXsrfProtection = true
+
+# Don't rerun the script on every file save — workspace edits unrelated
+# to the dashboard would otherwise trigger constant reruns.
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+
+# ---------------------------------------------------------------------------
+# Opt-in: LAN / public-IP access
+# ---------------------------------------------------------------------------
+#
+# The dashboard is read-only but exposes every metric, prediction, CSV,
+# and parquet artefact under data/ and outputs/. The Page 9 raw-envelope
+# preview is scrubbed by `_redact_preview`, so credentials in API
+# responses don't render, but everything else (model performance,
+# feature tables, intermediate aggregations) is visible to anyone who
+# can reach this host on port 8501.
+#
+# Only flip the settings below when:
+#   * the host is on a trusted network (e.g. home LAN behind NAT,
+#     or a tailnet), AND
+#   * you've verified nothing under data/ or outputs/ is sensitive.
+#
+# To enable LAN access, comment out the four lines above marked
+# "SAFE DEFAULTS" and uncomment these:
+#
+# [server]
+# address = "0.0.0.0"        # listen on every interface
+# enableCORS = false         # required for non-localhost browsers
+# enableXsrfProtection = false  # required for non-localhost websocket
+#
+# For public-internet exposure prefer a tunnel (tailscale funnel,
+# cloudflared, ngrok) over binding to 0.0.0.0 and opening the port
+# on your router — tunnels handle TLS termination and don't require
+# disabling Streamlit's built-in protections.
