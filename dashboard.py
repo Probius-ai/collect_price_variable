@@ -401,23 +401,76 @@ def _retrain_pid_alive(pid: int | None) -> bool:
         return e.errno != errno.ESRCH
 
 
+class RetrainLaunchError(RuntimeError):
+    """Raised when the force-retrain pre-flight check fails — surfaces a
+    human-readable reason in the UI instead of a silent subprocess crash."""
+
+
+def _force_retrain_preflight() -> tuple[Path, Path]:
+    """Validate everything the force-retrain subprocess needs BEFORE we
+    fork. On failure, raises RetrainLaunchError with a UI-friendly
+    message that names the exact missing piece.
+
+    Returns ``(config_path, log_path)`` when all checks pass.
+    """
+    config_path = ROOT / "config" / "mlops_smoke_test.yaml"
+    if not config_path.exists():
+        raise RetrainLaunchError(
+            f"설정 파일 누락: {config_path.relative_to(ROOT)}. "
+            "리포지토리가 부분적으로만 클론된 상태일 수 있습니다."
+        )
+    # Make sure the smoke-test module itself is importable from the
+    # interpreter we're about to launch — otherwise the subprocess
+    # would die with a ModuleNotFoundError that only shows up in the log.
+    import importlib.util
+    if importlib.util.find_spec("src.pipelines.mlops_smoke_test") is None:
+        raise RetrainLaunchError(
+            "`src.pipelines.mlops_smoke_test` 모듈을 import할 수 없습니다. "
+            "현재 dashboard가 실행 중인 Python 환경에 프로젝트가 "
+            "설치되지 않았거나 PYTHONPATH가 잘못되었습니다."
+        )
+
+    log_path = ROOT / "outputs" / "_retrain.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RetrainLaunchError(
+            f"`outputs/` 디렉토리에 쓸 수 없습니다 ({exc}). 권한 문제일 가능성이 큽니다."
+        ) from exc
+    # Make sure the RETRAIN_LOCK parent (same `outputs/`) is also good.
+    if not log_path.parent.is_dir():
+        raise RetrainLaunchError(
+            f"`{log_path.parent.relative_to(ROOT)}`가 디렉토리가 아닙니다."
+        )
+    return config_path, log_path
+
+
 def _trigger_force_retrain() -> dict:
     """Launch the MLOps smoke test in the background and persist the
     status marker. Returns the new status dict.
 
-    Wired so that:
-      * MLFLOW_TRACKING_URI is propagated (so the run lands on the
-        already-running local MLflow server, no separate Docker step).
-      * --log-to-mlflow is forced on (the whole point of the button is
-        to populate MLflow).
-      * Output goes to outputs/_retrain.log so the operator can tail it.
+    Environment robustness:
+      * Uses ``sys.executable`` (the interpreter currently running
+        Streamlit) instead of a hardcoded ``.venv/bin/python`` path —
+        works in Docker, on fresh clones, and on any platform.
+      * Pre-flight (`_force_retrain_preflight`) validates the config
+        file + module import + writable `outputs/` BEFORE we fork, so
+        failures surface as a clear UI message instead of a silent
+        subprocess crash logged only to disk.
+      * Closes the parent's reference to the log file handle right
+        after Popen — the subprocess inherits the fd, but the parent
+        (Streamlit's process) doesn't leak one per click.
+      * Detaches the subprocess so it survives the dashboard process
+        restarting. Uses `start_new_session=True` on POSIX (Linux /
+        macOS / WSL), no-op on Windows (`creationflags` would be the
+        Windows equivalent but isn't needed for this project's WSL
+        target).
     """
-    import os, subprocess
+    import os, subprocess, sys
     from datetime import datetime, timezone
 
-    log_path = ROOT / "outputs" / "_retrain.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_f = log_path.open("w", encoding="utf-8")
+    config_path, log_path = _force_retrain_preflight()
+
     env = {
         **os.environ,
         "MLFLOW_TRACKING_URI": os.environ.get(
@@ -429,22 +482,39 @@ def _trigger_force_retrain() -> dict:
         "ENABLE_MLFLOW": "true",
     }
     cmd = [
-        str(ROOT / ".venv" / "bin" / "python"),
+        sys.executable,  # whichever Python is running Streamlit right now
         "-m", "src.pipelines.mlops_smoke_test",
-        "--config", str(ROOT / "config" / "mlops_smoke_test.yaml"),
+        "--config", str(config_path),
         "--log-to-mlflow",
     ]
-    proc = subprocess.Popen(
-        cmd, stdout=log_f, stderr=subprocess.STDOUT, cwd=str(ROOT),
-        env=env, start_new_session=True,
-    )
+    popen_kwargs: dict = {
+        "stderr": subprocess.STDOUT,
+        "cwd": str(ROOT),
+        "env": env,
+    }
+    # Detach the subprocess so it survives a Streamlit restart. POSIX-only;
+    # on Windows we'd use creationflags=CREATE_NEW_PROCESS_GROUP, but this
+    # project's deployment target is WSL/Linux.
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+
+    # Open the log file as a context-managed handle so the PARENT's fd
+    # is closed right after Popen completes. The subprocess gets its own
+    # inherited fd via the OS, so it can keep writing without us holding
+    # a reference. Without this, every button click leaks one fd in the
+    # Streamlit process.
+    with log_path.open("w", encoding="utf-8") as log_f:
+        proc = subprocess.Popen(cmd, stdout=log_f, **popen_kwargs)
+
     status = {
         "pid": proc.pid,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "trigger": "force_retrain_button",
         "log_path": str(log_path.relative_to(ROOT)),
         "mlflow_uri": env["MLFLOW_TRACKING_URI"],
+        "python_executable": sys.executable,
     }
+    RETRAIN_LOCK.parent.mkdir(parents=True, exist_ok=True)
     RETRAIN_LOCK.write_text(json.dumps(status, indent=2), encoding="utf-8")
     return status
 
@@ -655,10 +725,14 @@ LNG는 가격 변동이 큰 연료입니다. 따라서:
                         f"시작 {current['started_at'][:19]})."
                     )
                 else:
-                    new_status = _trigger_force_retrain()
-                    st.success(
-                        f"재학습 시작 (PID {new_status['pid']}). 페이지를 새로고침하면 진행 상태가 업데이트됩니다."
-                    )
+                    try:
+                        new_status = _trigger_force_retrain()
+                        st.success(
+                            f"재학습 시작 (PID {new_status['pid']}). "
+                            "페이지를 새로고침하면 진행 상태가 업데이트됩니다."
+                        )
+                    except RetrainLaunchError as e:
+                        st.error(f"재학습 시작 실패: {e}")
 
         # Status display (always visible if a marker exists)
         status = _retrain_status()
