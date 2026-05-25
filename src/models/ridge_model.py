@@ -46,6 +46,14 @@ DEFAULT_RIDGE_FEATURES_MONTHLY = [
     "quarter",
     # NB: removed `is_lng_shock_period` (post-hoc / look-ahead leakage —
     # boundaries were defined retrospectively from the valid peak threshold).
+    # LNG leading-indicator (round 6 — solar/ integration).
+    # PUBLISH-TIMING DISCIPLINE: JKM monthly avg for month M is published
+    # ~mid-M+1, so LNG(M) is NOT observable at SMP info_cutoff=end-of-M.
+    # Only lagged versions are exposed; the unlagged column was removed
+    # after the round-6 leakage review.
+    "lng_price_usd_per_mmbtu_lag_1m",
+    "lng_price_usd_per_mmbtu_lag_2m",
+    "lng_price_chg_1m_lag_1m",
     # Settlement (wide-by-fuel, lag_1m) — added when settlement monthly is loaded.
     "settlement_unit_price_total_lag_1m",
     "settlement_unit_price_nuclear_lag_1m",

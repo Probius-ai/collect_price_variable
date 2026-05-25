@@ -68,6 +68,12 @@ DEFAULT_LGB_FEATURES_MONTHLY = [
     "is_winter",
     "is_peak_season",
     # NB: removed `is_lng_shock_period` (post-hoc / look-ahead leakage).
+    # LNG leading-indicator (round 6 — solar_beam DB → file, FRED JKM Asia)
+    # See ridge_model.py for the publish-timing discipline: LNG(M) is NOT
+    # observable at SMP info_cutoff=end-of-M, so only lagged columns are used.
+    "lng_price_usd_per_mmbtu_lag_1m",
+    "lng_price_usd_per_mmbtu_lag_2m",
+    "lng_price_chg_1m_lag_1m",
     # Settlement (lag_1m, full canonical fuel set)
     "settlement_unit_price_coal_anthracite_lag_1m",
     "settlement_unit_price_coal_bituminous_lag_1m",

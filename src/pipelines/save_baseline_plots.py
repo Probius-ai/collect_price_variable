@@ -477,7 +477,15 @@ python -m src.pipelines.save_baseline_plots --tag baseline_post_lng_v1
         docs_target.mkdir(parents=True, exist_ok=True)
         copied = 0
         for src_path in sorted(snap_dir.iterdir()):
-            if src_path.suffix == ".png" or src_path.name == "summary.md":
+            # Mirror PNGs + summary.md (visual), CSVs (tabular references the
+            # diff plots below need), and JSON metrics snapshots. Skip raw
+            # parquet snapshots and other heavy/unused artefacts.
+            if (
+                src_path.suffix == ".png"
+                or src_path.suffix == ".csv"
+                or src_path.name == "summary.md"
+                or src_path.suffix == ".json"
+            ):
                 shutil.copy2(src_path, docs_target / src_path.name)
                 copied += 1
         log.info("Mirrored %d files into %s (tracked, for committed reports)",

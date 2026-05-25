@@ -37,6 +37,12 @@ MONTHLY_AR_FEATURES = [
     "smp_lag_1m",
     "smp_rolling_3m_mean",
     "smp_lag_12m",
+    # LNG leading-indicator (round 6). FRED JKM Asia monthly avg is
+    # published ~mid-M+1 → LNG(M) NOT observable at SMP info_cutoff=end-of-M.
+    # Only lag_1m (= LNG(M-1)) is fair game. Unlagged column removed after
+    # round-6 leakage review.
+    "lng_price_usd_per_mmbtu_lag_1m",
+    "lng_price_chg_1m_lag_1m",
 ]
 
 

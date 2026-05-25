@@ -5,6 +5,32 @@ defaults:
   request_timeout_seconds: 30
   timezone: Asia/Seoul
 file_sources:
+  lng_price_monthly_file:
+    column_mapping:
+      lng_price_usd_per_mmbtu: lng_price_usd_per_mmbtu
+      period_month: period_month
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8
+    file_format: csv
+    filename_glob: lng_price_monthly.csv
+    frequency: monthly
+    last_verified_at: '2026-05-25'
+    limitations:
+    - Source = FRED PNGASJPUSDM (Global LNG price, Asia, USD per Million MMBtu).
+      Exported from solar_beam PostgreSQL via solar/lng_model.py companion.
+    - Monthly value is the JKM monthly average — published mid-month for the
+      preceding month. We treat LNG(M) as observable at end-of-M (information
+      cutoff), consistent with the rest of the project's forecast contract.
+    - 'Forecast horizon: LNG(M+1) ≈ LNG(M) (persistence baseline from
+      solar/lng_model.py). More sophisticated LNG forecasts from
+      solar/benchmark.py can replace this file later.'
+    official_name: FRED PNGASJPUSDM monthly LNG price (Asia)
+    schema_version: 1
+    source_id: lng_price_monthly_file
+    source_priority: 1
+    source_url: https://fred.stlouisfed.org/series/PNGASJPUSDM
+    unit: USD/MMBtu
   kpx_capacity_yearly_by_energy_source_home_file:
     column_mapping:
       row_category: 구분

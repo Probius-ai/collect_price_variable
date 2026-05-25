@@ -186,6 +186,7 @@ page = st.sidebar.radio(
         "4. Features",
         "5. Data Quality",
         "6. Walk-forward CV",
+        "7. LNG before/after",
     ],
 )
 
@@ -654,6 +655,102 @@ elif page == "6. Walk-forward CV":
                 hovermode="x unified",
             )
             st.plotly_chart(fig, width="stretch")
+
+
+# ---------------------------------------------------------------------------
+# Page 7: LNG before/after comparison
+# ---------------------------------------------------------------------------
+
+elif page == "7. LNG before/after":
+    st.header("LNG integration: before vs after")
+    st.caption(
+        "Compares three snapshots: pre-LNG (baseline_20260525), LNG with leakage "
+        "(baseline_post_lng_v1 — REVIEWED OUT), and LNG with publish-timing "
+        "discipline (baseline_post_lng_v2_leakfix — current honest result)."
+    )
+
+    PRE = Path("docs/figures/baseline_20260525")
+    LEAKY = Path("docs/figures/baseline_post_lng_v1")
+    SAFE = Path("docs/figures/baseline_post_lng_v2_leakfix")
+
+    # Numeric table
+    def _test_mae(snap_dir):
+        p = snap_dir / "metrics_comparison_snapshot.csv"
+        if not p.exists():
+            return None
+        m = pd.read_csv(p)
+        return m[m["split"] == "test"].set_index("model")["mae"]
+
+    pre_t = _test_mae(PRE)
+    leak_t = _test_mae(LEAKY)
+    safe_t = _test_mae(SAFE)
+    if pre_t is not None and safe_t is not None:
+        common = pre_t.index.intersection(safe_t.index)
+        df = pd.DataFrame({"pre-LNG": pre_t.loc[common], "post-LNG (leak-fixed)": safe_t.loc[common]})
+        if leak_t is not None:
+            df.insert(1, "LNG (leaky, rejected)", leak_t.loc[common])
+        df["Δ vs pre"] = (df["post-LNG (leak-fixed)"] - df["pre-LNG"]).round(3)
+        df["Δ %"] = (df["Δ vs pre"] / df["pre-LNG"] * 100).round(2)
+        df = df.sort_values("post-LNG (leak-fixed)").round(3)
+        df["kind"] = df.index.map(classify)
+        st.subheader("Test split MAE — three-way comparison")
+        st.dataframe(df, width="stretch")
+
+    # Walk-forward
+    def _wf_mae(snap_dir):
+        p = snap_dir / "walk_forward_comparison_snapshot.csv"
+        if not p.exists():
+            return None
+        return pd.read_csv(p).set_index("model")["mae"]
+
+    pre_w = _wf_mae(PRE)
+    safe_w = _wf_mae(SAFE)
+    if pre_w is not None and safe_w is not None:
+        common = pre_w.index.intersection(safe_w.index)
+        dfw = pd.DataFrame({"pre-LNG": pre_w.loc[common], "post-LNG": safe_w.loc[common]})
+        dfw["Δ"] = (dfw["post-LNG"] - dfw["pre-LNG"]).round(3)
+        dfw["Δ %"] = (dfw["Δ"] / dfw["pre-LNG"] * 100).round(2)
+        dfw = dfw.sort_values("post-LNG").round(3)
+        st.subheader("Walk-forward MAE — first time trainable beats persistence")
+        st.dataframe(dfw, width="stretch")
+
+    # Static PNGs from save_baseline_plots --docs-copy
+    st.subheader("3-way comparison plots (PNG snapshots)")
+    plot_files = [
+        ("plot_07_test_mae_3way_pre_leaky_safe.png",
+         "Test split — pre vs leaky vs leak-fixed"),
+        ("plot_08_walkforward_mae_3way_pre_leaky_safe.png",
+         "Walk-forward CV — leak-fixed trainable beats persistence floor"),
+    ]
+    for fname, caption in plot_files:
+        fp = SAFE / fname
+        if fp.exists():
+            st.image(str(fp), caption=caption, use_container_width=True)
+        else:
+            st.warning(f"Missing: {fp}")
+
+    with st.expander("Per-snapshot model overlays (Predictions plot from each tag)"):
+        for label, snap_dir in [
+            ("Pre-LNG", PRE),
+            ("LNG leaky (rejected)", LEAKY),
+            ("LNG leak-fixed (current)", SAFE),
+        ]:
+            p = snap_dir / "plot_01_predictions_test_all_models.png"
+            st.markdown(f"**{label}** — `{snap_dir.name}`")
+            if p.exists():
+                st.image(str(p), use_container_width=True)
+            else:
+                st.warning(f"Missing: {p}")
+
+    with st.expander("Persistence-lag zoom (delta plot for the LNG fix)"):
+        for label, snap_dir in [
+            ("Pre-LNG", PRE),
+            ("LNG leak-fixed", SAFE),
+        ]:
+            p = snap_dir / "plot_02_persistence_lag_zoom.png"
+            st.markdown(f"**{label}** — `{snap_dir.name}`")
+            if p.exists():
+                st.image(str(p), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------

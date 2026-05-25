@@ -392,6 +392,108 @@ def load_transaction_amount_daily_long() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def load_lng_price_monthly_long() -> pd.DataFrame:
+    """FRED Asia LNG monthly price (USD/MMBtu), via solar_beam DB export.
+
+    The month label = the calendar month for which the JKM monthly average
+    was computed. We treat that value as **observable at end-of-month**, i.e.
+    available at the SMP forecast's information_cutoff for the same month.
+    """
+    df = _load_one_source_parquet("lng_price_monthly_file")
+    if not df.empty:
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        df = df.sort_values("period_month").drop_duplicates(
+            subset=["period_month"], keep="last"
+        )
+    return df.reset_index(drop=True)
+
+
+def build_lng_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """LNG price features for the SMP feature table.
+
+    **Publish-timing discipline (round 6 leakage fix):**
+    FRED PNGASJPUSDM (JKM Asia monthly LNG average) for month M is the
+    average of all daily prices within M, and is **published around the
+    15th of M+1** (after World Bank receives the data). Therefore at the
+    SMP forecast's ``information_cutoff = end-of-M``, the value for
+    month M is NOT yet observable — only LNG up to month M−1 is.
+
+    We therefore expose ONLY lagged columns at row M:
+
+      * `lng_price_usd_per_mmbtu_lag_1m`   = LNG(M−1)   (observable at end-of-M)
+      * `lng_price_usd_per_mmbtu_lag_2m`   = LNG(M−2)
+      * `lng_price_chg_1m_lag_1m`          = (LNG(M−1)−LNG(M−2))/LNG(M−2)
+                                             — month-over-month change as of
+                                               the latest observable point
+
+    The unlagged current-month column is INTENTIONALLY DROPPED. Including
+    it would leak future information across the forecast cutoff (the
+    previous round-6 implementation did this and was caught by review).
+    A leakage-canary test in tests/test_round6_lng_integration.py pins
+    this contract.
+
+    Returns (DataFrame keyed on period_month, info dict).
+    """
+    long = load_lng_price_monthly_long()
+    info = {
+        "source_id": "lng_price_monthly_file",
+        "feature_origin_frequency": "monthly",
+        "rows_in_source": int(len(long)),
+        "period_range": None,
+        "missing_periods_in_smp_index": 0,
+        "publish_timing_note": (
+            "FRED PNGASJPUSDM monthly avg published ~mid-M+1; therefore at "
+            "SMP info_cutoff=end-of-M only LNG up to M-1 is observable. "
+            "Current-month column is NOT exposed as a feature."
+        ),
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+
+    base = long[["period_month", "lng_price_usd_per_mmbtu"]].copy()
+    base = base.sort_values("period_month").reset_index(drop=True)
+    # Reindex to a contiguous month grid, **extended by MAX_LAG months past
+    # raw.max** so the newest usable lag is exposed at the corresponding row.
+    # Without this extension the LNG output stops at raw.max, and when the
+    # SMP feature table extends one month past LNG raw (e.g. SMP refreshed
+    # ahead of the next LNG publication), the SMP row at raw.max+1 silently
+    # gets NaN for lag_1m even though LNG(raw.max) IS observable at that
+    # row's information_cutoff. Round-3 fixed the same pattern in
+    # `_exogenous_lag_1m`; this is the LNG-specific counterpart.
+    # MAX_LAG = 2 because we emit lag_1m and lag_2m.
+    _MAX_LAG_MONTHS = 2
+    extended_max = base["period_month"].max() + pd.DateOffset(months=_MAX_LAG_MONTHS)
+    full = pd.date_range(base["period_month"].min(), extended_max, freq="MS")
+    base = base.set_index("period_month").reindex(full)
+    base.index.name = "period_month"
+
+    # Build OUTPUT with ONLY lagged columns. The raw LNG(M) is used to
+    # derive the lags but never exposed as a feature.
+    raw = base["lng_price_usd_per_mmbtu"]
+    # IMPORTANT: pass fill_method=None explicitly. In pandas 2.x the
+    # deprecated default `fill_method='pad'` forward-fills NaN BEFORE
+    # computing pct_change — which would silently fabricate `chg=0` at the
+    # extended-grid positions (Tmax+1, Tmax+2) created by the round-6 grid
+    # extension fix. We want those positions to stay NaN until the real
+    # LNG value lands.
+    out = pd.DataFrame({
+        # observable at end-of-M = info_cutoff
+        "lng_price_usd_per_mmbtu_lag_1m": raw.shift(1),
+        "lng_price_usd_per_mmbtu_lag_2m": raw.shift(2),
+        # change between M-2 and M-1 (i.e., the most-recent observable Δ)
+        "lng_price_chg_1m_lag_1m": raw.pct_change(1, fill_method=None).shift(1),
+    })
+    out = out.reset_index()
+
+    info["period_range"] = (
+        str(out["period_month"].min()), str(out["period_month"].max())
+    )
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    )
+    return out, info
+
+
 # ---------------------------------------------------------------------------
 # Round-3 feature-block builders (each emits a per-period_month wide table)
 # ---------------------------------------------------------------------------
@@ -915,6 +1017,7 @@ def build_smp_monthly_features(
     include_settlement: bool = True,
     include_capacity: bool = True,
     include_transaction: bool = True,
+    include_lng: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """Build monthly features for a single area.
 
@@ -1017,6 +1120,13 @@ def build_smp_monthly_features(
         optional_info["transaction_volume"] = tx_volume_info
         optional_info["transaction_amount"] = tx_amount_info
         optional_info["transaction_price"] = price_info
+
+    if include_lng:
+        lng_block, lng_info = build_lng_features(feats["period_month"])
+        if not lng_block.empty:
+            lng_block = lng_block.drop_duplicates(subset=["period_month"], keep="last")
+            feats = feats.merge(lng_block, on="period_month", how="left")
+        optional_info["lng_price"] = lng_info
 
     # Hard invariant: optional joins must NOT change the SMP row count.
     if len(feats) != n_baseline_rows:

@@ -155,6 +155,15 @@ TRANSACTION_AMOUNT_DAILY_COLUMNS = [
     "source_file",
 ]
 
+# Round-6: LNG forecast / FRED LNG historical price.
+LNG_PRICE_MONTHLY_COLUMNS = [
+    "source_id",
+    "period_month",
+    "lng_price_usd_per_mmbtu",
+    "collected_at",
+    "source_file",
+]
+
 
 # ---------------------------------------------------------------------------
 # Generic tabular reader (CSV + XLSX, single + multi-row headers)
@@ -857,6 +866,34 @@ class KpxTransactionAmountDailyByFuelFileLoader(BaseFileLoader):
         return df[TRANSACTION_AMOUNT_DAILY_COLUMNS]
 
 
+class LngPriceMonthlyFileLoader(BaseFileLoader):
+    """FRED PNGASJPUSDM (Global LNG price, Asia) monthly CSV.
+
+    Output schema:
+        source_id, period_month, lng_price_usd_per_mmbtu, collected_at, source_file
+    """
+
+    source_name = "lng_price_monthly_file"
+
+    def required_columns(self) -> set[str]:
+        return set(LNG_PRICE_MONTHLY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        df = _coerce_numeric(df, ["lng_price_usd_per_mmbtu"])
+        df = df.dropna(subset=["lng_price_usd_per_mmbtu", "period_month"]).copy()
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[LNG_PRICE_MONTHLY_COLUMNS]
+            .sort_values("period_month")
+            .reset_index(drop=True)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -877,4 +914,5 @@ LOADERS: dict[str, type[BaseFileLoader]] = {
         KpxTransactionVolumeHourlyByFuelFileLoader,
     KpxTransactionAmountDailyByFuelFileLoader.source_name:
         KpxTransactionAmountDailyByFuelFileLoader,
+    LngPriceMonthlyFileLoader.source_name: LngPriceMonthlyFileLoader,
 }
