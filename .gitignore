@@ -85,3 +85,7 @@ outputs/predictions/**/*
 
 *.duckdb
 *.duckdb.wal
+
+# MLflow artifact root — bind-mounted by docker-compose, holds pickled
+# models + predictions per run. Can grow large; keep out of git.
+artifacts/mlflow/

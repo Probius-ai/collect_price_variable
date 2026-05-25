@@ -1,0 +1,94 @@
+# MLOps stack — MLflow tracking server backed by Postgres, plus an `app`
+# service that uses the project Docker image for ad-hoc training / smoke-
+# test invocations.
+#
+# Boot order:
+#   docker compose up -d            # postgres + mlflow only (server stays up)
+#   docker compose run --rm app …   # one-off training/smoke-test run
+#
+# Persistence:
+#   * Postgres data → named volume `mlflow_postgres_data`
+#   * MLflow artifacts → host bind ./artifacts/mlflow (gitignored, see .gitignore)
+#
+# Security: this stack is for local dev only. Postgres is exposed on
+# host port 5433 with default `mlflow:mlflow` credentials; MLflow has no
+# auth in front of it. Don't put this on a public network without a
+# reverse proxy + auth.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow}
+    volumes:
+      - mlflow_postgres_data:/var/lib/postgresql/data
+    ports:
+      # Host port 5433 → container 5432. Avoids collision with a local
+      # Postgres that often already binds 5432.
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-mlflow}", "-d", "${POSTGRES_DB:-mlflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mlflow:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Same defaults as .env.example. Override by exporting in your shell
+      # or by creating a .env file at the repo root (docker compose loads it).
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow}
+    command: >
+      mlflow server
+      --backend-store-uri postgresql+psycopg2://${POSTGRES_USER:-mlflow}:${POSTGRES_PASSWORD:-mlflow}@postgres:5432/${POSTGRES_DB:-mlflow}
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+      --serve-artifacts
+    volumes:
+      # Artifacts live on the host so they survive `docker compose down -v`
+      # and so you can inspect raw model.pkl / predictions.csv outside the
+      # container.
+      - ./artifacts/mlflow:/mlflow/artifacts
+    ports:
+      - "127.0.0.1:5000:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  app:
+    # Container for running training / smoke-test CLIs against the running
+    # MLflow service. Not started by `up -d` (it has `profiles: [tools]`)
+    # — invoke with `docker compose run --rm app <cmd>`.
+    build: .
+    profiles: ["tools"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      # When running inside compose, talk to MLflow by service name; the
+      # MLFLOW_TRACKING_URI in .env (http://localhost:5000) is for the host.
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-kpx-smp-monthly}
+      ENABLE_MLFLOW: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # Mount the project so edits don't require a rebuild, and data/outputs
+      # persist on the host.
+      - .:/app
+    working_dir: /app
+    # No default command — invoke with `docker compose run --rm app …`.
+
+volumes:
+  mlflow_postgres_data:

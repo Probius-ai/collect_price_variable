@@ -40,3 +40,13 @@ matplotlib>=3.8,<4.0
 # the next major release.
 streamlit>=1.57,<2.0
 plotly>=6.0,<7.0
+
+# MLflow tracking + (optional) model registry. Used by
+# `src/tracking/mlflow_utils.py` and the MLOps smoke-test pipeline
+# (`src/pipelines/mlops_smoke_test.py`). `psycopg2-binary` is the
+# Postgres driver MLflow needs for its `postgresql+psycopg2://` backend
+# store; pinning it here means `pip install -r requirements.txt` inside
+# the project Docker image (see `Dockerfile`) gives a working tracking
+# server out of the box.
+mlflow>=2.13,<3.0
+psycopg2-binary>=2.9
