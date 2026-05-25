@@ -18,7 +18,10 @@ under src/pipelines/.
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import pandas as pd
 import plotly.express as px
@@ -32,6 +35,7 @@ from src.models.registry import (
     TRAINABLE_MODELS,
     classify,
 )
+from src.utils.io import source_root_dir
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +50,173 @@ OUTPUTS = ROOT / "outputs"
 METRICS_CSV = OUTPUTS / "metrics" / "comparison.csv"
 MODELS_DIR = OUTPUTS / "models"
 DQ_DIR = OUTPUTS / "data_quality"
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction (defense-in-depth at display time)
+# ---------------------------------------------------------------------------
+#
+# Raw API envelopes on disk are SUPPOSED to be redacted by each collector
+# before persistence (see `redact_service_key_in_url` for KMA, the EIA
+# `request_log` masking, etc.). But the dashboard preview is a separate
+# trust boundary: a collector added later, an upstream error envelope that
+# echoes the key in its message body (data.go.kr SERVICE_KEY responses do
+# this), or a stale on-disk file written before the redaction fix would all
+# leak straight into the rendered page. We therefore scrub at READ time too.
+#
+# Patterns covered:
+#   * Query/JSON keys: serviceKey, api_key, apiKey, api-key, x-api-key,
+#     subscription-key, access_token, accessToken, Bearer/Authorization
+#   * Verbatim values pulled from the live process env vars (KMA_PUBLIC_API_KEY,
+#     KMA_PUBLIC_API_KEY_ENCODED, EIA_API_KEY) — only if they're set AND non-trivial
+#
+# Keep this fast: it runs on every preview render.
+
+# Any key/header name whose body word is one of: key, token, secret, auth,
+# password/passwd/pwd, credential, cookie, session, sso. The leading
+# `[A-Za-z_-]*` lets us catch `apiKey`, `service_key`, `x-api-key`,
+# `JSESSIONID`, `aws_access_key_id`, `client_secret`, etc. without
+# enumerating every name. Quoting + separator handle JSON, querystring,
+# YAML-ish, and HTTP-header forms.
+_CREDENTIAL_KEY_RE = re.compile(
+    r"""
+    (                                       # 1: leading key + separator
+        "?[A-Za-z0-9_-]*                    # optional opening quote + prefix chars
+        (?:key|token|secret|auth|password|passwd|pwd|credential|cookie|session|sso)
+        [A-Za-z0-9_-]*                      # suffix chars
+        "?                                  # optional closing quote
+        \s*
+        (?:[=:]\s*"?)                       # = or :, then optional opening quote
+    )
+    (                                       # 2: the value to redact
+        [^"'&\s,;}\]<]+                     # stop at quote, &, whitespace, , ; } ] <
+                                            # (`<` not `>`: an XML close-tag is
+                                            # `</element>`, so `<` correctly
+                                            # bounds the value, and `<REDACTED>`
+                                            # placeholders survive a second pass
+                                            # → redaction is idempotent.)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Authorization header — captures the ENTIRE header value (everything
+# after the scheme word), in two forms:
+#
+#   * JSON-quoted: ``"Authorization":"<scheme> <rest>"`` — value extends to
+#     the closing JSON quote (handles ``\"`` escapes inside).
+#   * HTTP raw:    ``Authorization: <scheme> <rest>\r\n`` — value extends to
+#     end-of-line, but stops at ``"`` so we don't consume the surrounding
+#     JSON structure when ``Authorization`` happens to appear inside a
+#     string value.
+#
+# Why capture the whole value instead of just one token: parameterised
+# headers (HMAC, AWS SigV4, OAuth1, Digest) pack multiple credential
+# parameters into a single header — ``signature=…``, ``response=…``,
+# ``oauth_signature=…`` — many of which don't match the generic key
+# keyword set. Wholesale masking avoids per-parameter coverage gaps.
+#
+# Both MUST run before ``_CREDENTIAL_KEY_RE``, otherwise the latter matches
+# ``Authorization:``, captures the scheme word as the value, and the actual
+# credential after the space slips through unmasked.
+_AUTH_HEADER_JSON_RE = re.compile(
+    r"""
+    (
+        ["']Authorization["']\s*:\s*["']   # "Authorization":" or 'Authorization':'
+    )
+    (
+        (?:[^"'\\]|\\["'\\])+              # value (handles \" / \' / \\ escapes)
+    )
+    (["'])                                 # closing quote
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_AUTH_HEADER_HTTP_RE = re.compile(
+    r"""
+    (
+        Authorization
+        \s*:\s*
+        [A-Za-z0-9_+-]+                    # scheme: Bearer / Basic / HMAC / AWS4-HMAC-SHA256 / OAuth / Digest / Token / ...
+        \s+
+    )
+    (
+        [^\r\n]+                           # entire value to end-of-line, INCLUDING internal " characters
+                                           # (necessary for OAuth1's quoted parameters; the JSON-form regex
+                                           # runs first and consumes well-formed JSON Authorization fields,
+                                           # so the only remaining `Authorization:` matches are raw HTTP-style)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Naked JWT anywhere in the body — three base64url segments joined by `.`.
+# Catches tokens echoed in error envelopes without a `Bearer ` prefix.
+_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
+
+# Credential-shaped env-var names: any var whose name contains one of these
+# tokens is treated as sensitive and substring-masked from the preview.
+_CRED_ENV_NAME_RE = re.compile(
+    r"(key|token|secret|auth|password|passwd|pwd|credential|cookie|session|sso)",
+    re.IGNORECASE,
+)
+
+# Minimum length before we substring-mask an env value. Below this we risk
+# wiping legitimate substrings (e.g. an env var set to "dev").
+_ENV_MIN_MASK_LEN = 16
+
+
+def _redact_preview(text: str) -> str:
+    """Mask anything that looks like a credential before display.
+
+    Defense in depth — collectors are supposed to redact at write time,
+    but a future collector or an upstream error envelope that echoes a key
+    in a free-text field would slip past. This is intentionally aggressive:
+    a false positive (masking a value that wasn't sensitive) is cheap
+    because the user can still open the file directly; a false negative
+    (leaking a real key on the dashboard) is the bug we're defending
+    against.
+    """
+    if not text:
+        return text
+    # Authorization headers MUST run before the generic key regex (see
+    # ordering note on `_AUTH_HEADER_JSON_RE`/`_AUTH_HEADER_HTTP_RE`).
+    # JSON form first so the structure-preserving regex masks the value
+    # cleanly without the HTTP regex's greedier end-of-line capture
+    # destroying the surrounding JSON.
+    out = _AUTH_HEADER_JSON_RE.sub(
+        lambda m: f"{m.group(1)}<REDACTED>{m.group(3)}", text
+    )
+    out = _AUTH_HEADER_HTTP_RE.sub(lambda m: f"{m.group(1)}<REDACTED>", out)
+    out = _CREDENTIAL_KEY_RE.sub(lambda m: f"{m.group(1)}<REDACTED>", out)
+    out = _JWT_RE.sub("<REDACTED>", out)
+
+    # Auto-discover credential-shaped env vars rather than hardcoding a list,
+    # so a future collector that adds (e.g.) WEATHER_API_KEY gets masked
+    # automatically. Mask BOTH the raw value AND its URL-encoded form, since
+    # data.go.kr issues the same key in two forms (raw with `/+=`, encoded
+    # with `%2F%2B%3D`) and the on-disk envelope may carry whichever form
+    # was actually transmitted.
+    for env_name, val in os.environ.items():
+        if not val or len(val) < _ENV_MIN_MASK_LEN:
+            continue
+        if not _CRED_ENV_NAME_RE.search(env_name):
+            continue
+        out = out.replace(val, "<REDACTED>")
+        try:
+            encoded = quote(val, safe="")
+        except Exception:
+            encoded = val
+        if encoded != val:
+            out = out.replace(encoded, "<REDACTED>")
+        try:
+            decoded = unquote(val)
+        except Exception:
+            decoded = val
+        if decoded != val and len(decoded) >= _ENV_MIN_MASK_LEN:
+            out = out.replace(decoded, "<REDACTED>")
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -187,6 +358,8 @@ page = st.sidebar.radio(
         "5. Data Quality",
         "6. Walk-forward CV",
         "7. LNG before/after",
+        "8. LNG forecast (PDF-guided)",
+        "9. Round 8-9 collectors",
     ],
 )
 
@@ -751,6 +924,320 @@ elif page == "7. LNG before/after":
             st.markdown(f"**{label}** — `{snap_dir.name}`")
             if p.exists():
                 st.image(str(p), use_container_width=True)
+
+    # Round-8 snapshot — adds JKM/EIA/KMA paths
+    R8 = Path("docs/figures/baseline_round8_jkm_eia_kma")
+    if R8.exists():
+        st.subheader("Round-8 snapshot — JKM forward + EIA STEO + KMA wired in")
+        for fname, caption in [
+            ("plot_04_test_mae_r2_comparison.png", "Test MAE & R² (round-8 snapshot)"),
+            ("plot_05_walk_forward_long_range.png", "Walk-forward long range"),
+            ("plot_06_feature_group_ablation_heatmap.png",
+             "Feature-group ablation (round-8 snapshot)"),
+        ]:
+            fp = R8 / fname
+            if fp.exists():
+                st.image(str(fp), caption=caption, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Page 8: LNG forecast (PDF-guided, round 7)
+# ---------------------------------------------------------------------------
+
+elif page == "8. LNG forecast (PDF-guided)":
+    st.header("LNG forecast — PDF-guided model (round 7)")
+    st.caption(
+        "Standalone LNG price forecaster built per the two PDF guides "
+        "(에너지가격예측 파이프라인 / energy-price-forecast-pipeline-guide). "
+        "TimeSeriesSplit + embargo, LightGBM with inner-validation early stopping "
+        "(round-7 leakage fix), MLP with per-fold scaler isolation, naive_lag1 "
+        "baseline. Metrics are mean ± std across folds."
+    )
+
+    LNG_ROOT = OUTPUTS / "lng_forecast"
+    if not LNG_ROOT.exists():
+        st.warning(
+            "No `outputs/lng_forecast/` yet. Run "
+            "`python -m src.pipelines.train_lng_forecast --horizon-months 1 "
+            "--n-splits 5 --embargo 1`."
+        )
+    else:
+        runs = sorted(p.name for p in LNG_ROOT.iterdir() if p.is_dir())
+        if not runs:
+            st.info("No runs under `outputs/lng_forecast/`.")
+        else:
+            run = st.selectbox("Run", runs, index=len(runs) - 1)
+            run_dir = LNG_ROOT / run
+
+            # Panel info — sample size, feature inventory
+            panel_path = run_dir / "panel_info.json"
+            if panel_path.exists():
+                panel = json.loads(panel_path.read_text())
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Rows (post NaN-drop)", panel.get("rows", "—"))
+                c2.metric("Features", panel.get("n_features", "—"))
+                c3.metric("Horizon (months)", panel.get("horizon_months", "—"))
+                c4.metric(
+                    "Period",
+                    f"{str(panel.get('period_min', '—'))[:7]} → "
+                    f"{str(panel.get('period_max', '—'))[:7]}",
+                )
+
+            # Cross-model comparison
+            comp_csv = run_dir / "comparison.csv"
+            if comp_csv.exists():
+                st.subheader("Cross-validation comparison")
+                cmp = pd.read_csv(comp_csv).round(3)
+                st.dataframe(cmp, width="stretch", hide_index=True)
+                fig = px.bar(
+                    cmp.sort_values("mae_mean"),
+                    x="model", y="mae_mean", error_y="mae_std",
+                    text="mae_mean", color="model",
+                    title="LNG forecast MAE (mean ± std across folds)",
+                )
+                fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+                fig.update_layout(showlegend=False)
+                st.plotly_chart(fig, width="stretch")
+
+                fig2 = px.bar(
+                    cmp.sort_values("rmse_mean"),
+                    x="model", y="rmse_mean", error_y="rmse_std",
+                    text="rmse_mean", color="model",
+                    title="LNG forecast RMSE (mean ± std across folds)",
+                )
+                fig2.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+                fig2.update_layout(showlegend=False)
+                st.plotly_chart(fig2, width="stretch")
+
+                st.info(
+                    "**Finding:** the `naive_lag1` baseline wins on this CV slice. "
+                    "Trainable models (LightGBM, MLP) do not yet beat naive lag-1 on "
+                    "monthly JKM levels — consistent with the PDF guide's note that "
+                    "monthly-frequency LNG is dominated by persistence."
+                )
+
+            # Per-model predictions
+            st.subheader("Per-model fold predictions")
+            model_dirs = sorted(
+                p.name for p in run_dir.iterdir()
+                if p.is_dir() and (p / "predictions.csv").exists()
+            )
+            sel = st.multiselect(
+                "Models to overlay", model_dirs,
+                default=model_dirs[: min(3, len(model_dirs))],
+            )
+            if sel:
+                fig = go.Figure()
+                actual_drawn = False
+                for m in sel:
+                    df = pd.read_csv(run_dir / m / "predictions.csv")
+                    if "period_month" in df.columns:
+                        df["period_month"] = pd.to_datetime(df["period_month"])
+                        df = df.sort_values("period_month")
+                    if not actual_drawn and "y_true" in df.columns:
+                        fig.add_trace(go.Scatter(
+                            x=df["period_month"], y=df["y_true"],
+                            name="Actual JKM (USD/MMBtu)", mode="lines+markers",
+                            line=dict(color="black", width=2.5),
+                        ))
+                        actual_drawn = True
+                    if "y_pred" in df.columns:
+                        fig.add_trace(go.Scatter(
+                            x=df["period_month"], y=df["y_pred"],
+                            name=f"{m} (pred)", mode="lines+markers",
+                            line=dict(dash="dot"),
+                        ))
+                fig.update_layout(
+                    title="LNG forecast: actual vs predicted (out-of-fold)",
+                    xaxis_title="period_month", yaxis_title="JKM [USD/MMBtu]",
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig, width="stretch")
+
+            # Feature inventory expander
+            if panel_path.exists():
+                with st.expander("Feature columns used (panel_info.json)"):
+                    st.json(panel, expanded=False)
+
+
+# ---------------------------------------------------------------------------
+# Page 9: Round 8-9 collectors (EIA STEO + JKM + KMA + raw weather DB)
+# ---------------------------------------------------------------------------
+
+elif page == "9. Round 8-9 collectors":
+    st.header("Round 8-9 collectors")
+    st.caption(
+        "API-driven sources added in the last two rounds: EIA STEO "
+        "(world oil/gas outlook), JKM daily history + forward curve, KMA "
+        "mid-term temperature + village (단기예보), plus a one-shot "
+        "raw_weather monthly aggregation pulled from solar_beam's DB."
+    )
+
+    DATA_RAW = ROOT / "data" / "raw"
+
+    @st.cache_data(show_spinner=False)
+    def _scan_collector_root(root_str: str) -> dict:
+        """Roll up response_*.json + parsed_*.parquet under an absolute root.
+
+        Cached on the stringified path because Streamlit's cache hashes the
+        argument; `Path` is hashable but we keep the API string-typed so the
+        cache key is stable across imports.
+        """
+        root = Path(root_str)
+        if not root.exists():
+            return {"present": False}
+        raws = sorted(root.rglob("response_*.json"))
+        parsed = sorted(root.rglob("parsed_*.parquet"))
+        latest_raw = raws[-1] if raws else None
+        latest_rows = 0
+        if parsed:
+            try:
+                latest_rows = len(pd.read_parquet(parsed[-1]))
+            except Exception:
+                latest_rows = 0
+        return {
+            "present": True,
+            "n_raw": len(raws),
+            "n_parsed": len(parsed),
+            "latest_raw": str(latest_raw.relative_to(ROOT)) if latest_raw else None,
+            "latest_parsed_rows": latest_rows,
+            "latest_parsed_path": (
+                str(parsed[-1].relative_to(ROOT)) if parsed else None
+            ),
+        }
+
+    # source_id → human label. Path is derived via `source_root_dir(source_id)`
+    # which is the same helper `BaseFileLoader.load_one()` uses to write
+    # `parsed_*.parquet` snapshots — so inventory counts always match what's
+    # actually on disk, regardless of how the source-root scheme evolves.
+    collectors = {
+        "eia_steo":                       "EIA STEO (BREPUUS / WTIPUUS / NGHHMCF)",
+        "kma_village_fcst":               "KMA village forecast (단기예보)",
+        "kma_mid_temperature":            "KMA mid-term temperature",
+        "jkm_lng_daily_history_file":     "JKM LNG daily history (file)",
+        "jkm_lng_futures_curve_file":     "JKM LNG futures curve (file)",
+        "raw_weather_monthly_db_file":    "Raw weather monthly (from solar_beam DB)",
+        "kma_grid_xy_mapping_file":       "KMA grid x/y mapping (xlsx)",
+        "oil_price_monthly_file":         "Oil price monthly (file)",
+        "fx_usd_krw_monthly_file":        "FX USD/KRW monthly (file)",
+        "lng_price_monthly_file":         "LNG price monthly (file)",
+    }
+    rows = []
+    for source_id, label in collectors.items():
+        out_root = source_root_dir(source_id)
+        info = _scan_collector_root(str(out_root))
+        try:
+            rel = str(out_root.relative_to(ROOT))
+        except ValueError:
+            rel = str(out_root)
+        rows.append({
+            "source": label,
+            "path": rel,
+            "raw payloads": info.get("n_raw", 0) if info["present"] else "—",
+            "parsed snapshots": info.get("n_parsed", 0) if info["present"] else "—",
+            "latest rows": info.get("latest_parsed_rows", 0) if info["present"] else "—",
+            "present": "✓" if info["present"] else "—",
+        })
+    st.subheader("Collector inventory")
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    # Recent raw envelopes — verbatim audit trail
+    st.subheader("Recent KMA / EIA raw envelopes (verbatim audit trail)")
+    st.caption(
+        "Round-9 fix: data.go.kr error responses are persisted verbatim "
+        "BEFORE the collector raises, with microsecond + sha256 disambiguator "
+        "so same-second retries don't overwrite each other. Each line below "
+        "is a saved `response_*.json` with the server's untouched body and "
+        "`serviceKey` redacted to `<REDACTED>`."
+    )
+    envelope_paths: list[Path] = []
+    for sub in ("kma/village_fcst", "kma/mid_temperature", "eia/steo"):
+        root = DATA_RAW / sub
+        if root.exists():
+            envelope_paths.extend(sorted(root.rglob("response_*.json"))[-3:])
+    if not envelope_paths:
+        st.info("No raw envelopes on disk yet.")
+    else:
+        env_rows = []
+        for p in envelope_paths:
+            try:
+                stat = p.stat()
+                size_kb = round(stat.st_size / 1024, 1)
+            except OSError:
+                size_kb = None
+            env_rows.append({
+                "file": str(p.relative_to(ROOT)),
+                "size (KB)": size_kb,
+            })
+        st.dataframe(pd.DataFrame(env_rows), width="stretch", hide_index=True)
+
+        sel_env = st.selectbox(
+            "Inspect an envelope (first 4 KB)",
+            [r["file"] for r in env_rows],
+            index=len(env_rows) - 1,
+        )
+        st.caption(
+            "Credentials (`serviceKey`, `api_key`, `Authorization: Bearer …`, "
+            "and verbatim env-var values) are scrubbed at display time as "
+            "defense-in-depth — collector-level redaction is the primary line "
+            "of defense, this preview is the second."
+        )
+        try:
+            head = (ROOT / sel_env).read_text(encoding="utf-8")[:4096]
+            st.code(_redact_preview(head), language="json")
+        except OSError as exc:
+            st.error(f"Could not read {sel_env}: {exc}")
+
+    # Raw weather monthly preview (extracted from solar_beam DB)
+    st.subheader("Raw weather monthly (extracted from solar_beam DB)")
+    wp = DATA_RAW / "manual_or_filedata" / "raw_weather_monthly_db_file" / "weather_monthly_from_db.csv"
+    if wp.exists():
+        wdf = pd.read_csv(wp)
+        if "period_month" in wdf.columns:
+            wdf["period_month"] = pd.to_datetime(wdf["period_month"])
+        # CSV column is `region_name` (Korean: 강원 / 경기 / …). The earlier
+        # `region` reference here matched nothing, so region count + per-region
+        # plot were silently empty.
+        REGION_COL = "region_name"
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Monthly rows", len(wdf))
+        if REGION_COL in wdf.columns:
+            c2.metric("Regions", wdf[REGION_COL].nunique())
+        if "period_month" in wdf.columns and len(wdf):
+            c3.metric(
+                "Period",
+                f"{wdf['period_month'].min():%Y-%m} → {wdf['period_month'].max():%Y-%m}",
+            )
+
+        numeric_cols = [c for c in wdf.columns if c not in {"period_month", REGION_COL}
+                        and pd.api.types.is_numeric_dtype(wdf[c])]
+        if numeric_cols and "period_month" in wdf.columns:
+            metric = st.selectbox("Metric to plot", numeric_cols, index=0)
+            region_opts = (
+                sorted(wdf[REGION_COL].dropna().unique())
+                if REGION_COL in wdf.columns else []
+            )
+            chosen = st.multiselect(
+                "Regions", region_opts,
+                default=region_opts[: min(3, len(region_opts))],
+            ) if region_opts else None
+            plot_df = wdf if not chosen else wdf[wdf[REGION_COL].isin(chosen)]
+            fig = px.line(
+                plot_df.sort_values([REGION_COL, "period_month"])
+                if REGION_COL in plot_df.columns
+                else plot_df.sort_values("period_month"),
+                x="period_month", y=metric,
+                color=REGION_COL if REGION_COL in plot_df.columns else None,
+                title=f"Monthly weather — {metric}",
+            )
+            st.plotly_chart(fig, width="stretch")
+        with st.expander("Raw weather table (first 100 rows)"):
+            st.dataframe(wdf.head(100), width="stretch")
+    else:
+        st.info(
+            "weather_monthly_from_db.csv not found — "
+            "run the solar_beam → monthly aggregation script."
+        )
 
 
 # ---------------------------------------------------------------------------
