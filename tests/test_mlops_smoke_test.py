@@ -217,20 +217,26 @@ def test_v5_uses_latest_rolling_validation_when_no_future_holdout(
         assert v5[col].isna().all() or (v5[col] == "None").all() or (v5[col] == "").all()
 
 
-def test_log_model_summary_runs_emits_stepped_metric_series():
-    """Pin the data shape that makes MLflow render line charts.
+def test_overlay_summary_run_encodes_model_name_into_metric_keys():
+    """Pin the data shape that makes MLflow overlay N models on one chart.
 
-    For each model, the summary helper must:
-      * emit exactly one record per version that has metrics
-      * pass `step=N` (extracted from "vN") so MLflow's metric history
-        sees 5 distinct steps → renders as a 5-point line chart
-      * never emit a step for a skipped run (would inject NaN at a real
-        step and break the line)
+    The overlay helper must:
+      * emit ONE summary run (not N), since the user wants every model
+        overlaid in the same Metrics tab
+      * encode the model name into the metric key as `{metric}__{model}`,
+        so MLflow treats each model's series as a distinct line
+      * log per-version values at `step=N` (from "vN") so the x-axis is
+        version-ordered
+      * NEVER emit a step value for a skipped (version, model) — that
+        would inject a hole in the line where there isn't really a value
     """
-    from src.pipelines.mlops_smoke_test import _log_model_summary_runs, VersionResult
+    from src.pipelines.mlops_smoke_test import (
+        _log_overlay_summary_run, VersionResult,
+    )
+    from unittest.mock import patch
+    from contextlib import contextmanager
 
-    # Build a fake results set: 3 versions for "ridge", 2 of which have
-    # metrics + 1 skipped.
+    # Two models × three versions. v3 of ridge is skipped.
     results = [
         VersionResult(
             version="v1", model_name="ridge", data_cutoff_month="2021-12-01",
@@ -253,16 +259,27 @@ def test_log_model_summary_runs_emits_stepped_metric_series():
             metrics={}, mlflow_run_id=None, artifact_dir=None,
             skipped=True, skip_reason="synthetic skip",
         ),
+        VersionResult(
+            version="v1", model_name="persistence_monthly",
+            data_cutoff_month="2021-12-01", train_end="2021-12-01",
+            test_start="2022-01-01", test_end="2022-12-01",
+            evaluation_mode="fixed_holdout", n_train=10, n_test=12,
+            metrics={"mae": 26.0, "rmse": 31.0}, mlflow_run_id=None,
+            artifact_dir=None, skipped=False,
+        ),
+        VersionResult(
+            version="v2", model_name="persistence_monthly",
+            data_cutoff_month="2022-12-01", train_end="2022-12-01",
+            test_start="2023-01-01", test_end="2023-12-01",
+            evaluation_mode="fixed_holdout", n_train=22, n_test=12,
+            metrics={"mae": 18.0, "rmse": 22.0}, mlflow_run_id=None,
+            artifact_dir=None, skipped=False,
+        ),
     ]
-
-    # Capture what gets logged WITHOUT needing a live MLflow server by
-    # patching maybe_mlflow_run to yield a recording fake.
-    from unittest.mock import patch
-    from contextlib import contextmanager
 
     class _RecorderRun:
         def __init__(self):
-            self.run_id = "fake-id"
+            self.run_id = "fake-overlay-id"
             self.params: dict = {}
             self.metrics_calls: list[tuple[dict, int | None]] = []
         def log_params(self, p): self.params.update(p)
@@ -281,34 +298,48 @@ def test_log_model_summary_runs_emits_stepped_metric_series():
         yield r
 
     with patch("src.pipelines.mlops_smoke_test.maybe_mlflow_run", _fake_run):
-        ids = _log_model_summary_runs(results=results, log_to_mlflow=True)
+        rid = _log_overlay_summary_run(results=results, log_to_mlflow=True)
 
-    # One summary run per model (we only fed 'ridge', so one recorder)
-    assert len(recorders) == 1
-    assert ids == {"ridge": "fake-id"}
+    # EXACTLY ONE summary run (no per-model split)
+    assert len(recorders) == 1, (
+        f"Expected exactly one overlay summary run, got {len(recorders)}"
+    )
+    assert rid == "fake-overlay-id"
     rec = recorders[0]
 
-    # Should have logged exactly 2 metric batches (v1 + v2, NOT v3)
+    # Two log_metrics calls — one per version (v1 + v2). v3 had only
+    # ridge and ridge was skipped → payload empty → no log call.
     assert len(rec.metrics_calls) == 2, rec.metrics_calls
     steps = sorted(call[1] for call in rec.metrics_calls)
-    assert steps == [1, 2], f"expected step=1,2 for v1,v2; got {steps}"
+    assert steps == [1, 2], f"expected step=1,2; got {steps}"
 
-    # The skipped v3 must NOT have been logged
-    for _m, step in rec.metrics_calls:
-        assert step != 3, "v3 was skipped but appeared in summary stream"
+    # Each step's payload encodes BOTH models' metric values under
+    # `{metric}__{model}` keys → MLflow overlays them as 2 lines.
+    expected_v1_keys = {
+        "mae__ridge", "rmse__ridge",
+        "mae__persistence_monthly", "rmse__persistence_monthly",
+    }
+    expected_v2_keys = expected_v1_keys  # same models, same metrics
+    actual_keys_per_step = {step: set(m.keys()) for m, step in rec.metrics_calls}
+    assert actual_keys_per_step[1] == expected_v1_keys, actual_keys_per_step[1]
+    assert actual_keys_per_step[2] == expected_v2_keys, actual_keys_per_step[2]
 
-    # Both points carry the same metric keys → line chart will render
-    keys_per_step = [set(m.keys()) for m, _ in rec.metrics_calls]
-    assert keys_per_step[0] == keys_per_step[1] == {"mae", "rmse"}
+    # The skipped v3-of-ridge MUST NOT appear in any key — no
+    # `mae__ridge` at step=3
+    for payload, step in rec.metrics_calls:
+        if step == 3:
+            assert "mae__ridge" not in payload, (
+                "skipped v3/ridge leaked into overlay run"
+            )
 
 
-def test_log_model_summary_runs_noop_when_logging_disabled():
-    """When MLflow logging is off, no summary runs are emitted — the
-    feature is purely a UI helper, never load-bearing."""
-    from src.pipelines.mlops_smoke_test import _log_model_summary_runs
+def test_overlay_summary_run_noop_when_logging_disabled():
+    """When MLflow logging is off, no summary run is emitted — pure UI
+    helper, never load-bearing."""
+    from src.pipelines.mlops_smoke_test import _log_overlay_summary_run
 
-    ids = _log_model_summary_runs(results=[], log_to_mlflow=False)
-    assert ids == {}
+    rid = _log_overlay_summary_run(results=[], log_to_mlflow=False)
+    assert rid is None
 
 
 def test_v5_rolling_validation_never_scores_target_beyond_cutoff(

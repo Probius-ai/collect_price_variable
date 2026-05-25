@@ -670,62 +670,84 @@ def _record_skip(
 # ---------------------------------------------------------------------------
 
 
-def _log_model_summary_runs(
+def _log_overlay_summary_run(
     *, results: list[VersionResult], log_to_mlflow: bool,
-) -> dict[str, str | None]:
-    """For each model, log one ADDITIONAL MLflow run that records v1..v5
-    metrics as a stepped series (step=1..5).
+) -> str | None:
+    """Log ONE MLflow run that overlays every model's v1..v5 trajectory
+    on shared metric charts.
 
-    MLflow's Run-detail page natively renders a metric series with
-    distinct step values as a LINE chart, so this gives the user one
-    line chart per model spanning v1..v5 — instead of the default
-    one-bar-per-run view across the 35 individual runs.
+    MLflow's Run-detail Metrics tab plots distinct metric keys as
+    separate lines that overlay when selected together. If we encode
+    the model name INTO the metric key (e.g. ``mae__ridge``,
+    ``mae__lightgbm``, …) and log each at step=1..5, then opening the
+    Metrics tab and checking every ``mae__*`` checkbox gives N lines
+    on a single chart with x-axis = version.
 
-    The 35 individual (version, model) runs stay intact for artifact
-    access (predictions.csv, model.pkl). The summary runs only carry
-    the stepped metrics + run-level tags (summary=true, model_name=…)
-    so they can be filtered in the Runs table.
+    Returns the run_id (or None when MLflow logging is disabled).
 
-    Returns a dict ``{model_name: summary_run_id}`` for downstream use.
+    Naming convention: ``{metric_name}__{model_name}``. Double-
+    underscore is used so a model name containing a single underscore
+    (``naive_lag_1m``, ``monthly_ar_ridge``) still parses unambiguously
+    if a reader splits on ``__``.
     """
-    summary_ids: dict[str, str | None] = {}
     if not log_to_mlflow:
-        return summary_ids
+        return None
 
+    # Numeric step ordering across versions
     by_model: dict[str, list[VersionResult]] = {}
+    model_order: list[str] = []
     for r in results:
+        if r.model_name not in by_model:
+            model_order.append(r.model_name)
         by_model.setdefault(r.model_name, []).append(r)
 
-    for model_name, runs in by_model.items():
-        # v1, v2, …, v5 — sort numerically so step ordering is correct
-        runs_sorted = sorted(runs, key=lambda x: int(x.version.lstrip("v")))
-        with maybe_mlflow_run(
-            enable=True,
-            run_name=f"summary_{model_name}",
-            tags={
-                "summary": "true",
-                "model_name": model_name,
-                "smoke_test": "v1_v5",
-                "view_hint": "open Metrics tab for v1..v5 line chart",
-            },
-        ) as run:
-            run.log_params({
-                "model_name": model_name,
-                "n_versions": len(runs_sorted),
-                "versions": ",".join(r.version for r in runs_sorted),
-                "summary_kind": "v1_v5_line_chart",
-            })
-            for r in runs_sorted:
-                if not r.metrics or r.skipped:
-                    continue
-                step = int(r.version.lstrip("v"))
-                # Bulk-log every numeric metric at this step. MLflow
-                # treats each `step` value as a new data point on the
-                # metric's history → 5 points = 5-point line chart.
-                run.log_metrics(r.metrics, step=step)
-            summary_ids[model_name] = run.run_id
+    with maybe_mlflow_run(
+        enable=True,
+        run_name="summary_overlay_v1_v5",
+        tags={
+            "summary": "true",
+            "kind": "overlay",
+            "smoke_test": "v1_v5",
+            "view_hint": (
+                "Open Metrics tab → check every `mae__*` (or rmse__*, "
+                "mape__*, r2__*) checkbox → MLflow overlays one line "
+                "per model on shared x-axis (step=version)."
+            ),
+        },
+    ) as run:
+        # Get the set of metric names that any non-skipped result has
+        all_metric_names: set[str] = set()
+        for r in results:
+            if r.metrics and not r.skipped:
+                all_metric_names.update(r.metrics.keys())
 
-    return summary_ids
+        run.log_params({
+            "summary_kind": "overlay_all_models",
+            "n_models": len(by_model),
+            "n_versions": len({r.version for r in results}),
+            "metric_keys_per_model": ",".join(sorted(all_metric_names)),
+            "models": ",".join(model_order),
+        })
+
+        # Walk version-by-version so each step gets one log_metrics call.
+        # Group all (version, model) results by version, then within
+        # each version emit `{metric}__{model}` = value at that step.
+        by_version: dict[str, list[VersionResult]] = {}
+        for r in results:
+            by_version.setdefault(r.version, []).append(r)
+
+        for version in sorted(by_version, key=lambda v: int(v.lstrip("v"))):
+            step = int(version.lstrip("v"))
+            payload: dict[str, float] = {}
+            for r in by_version[version]:
+                if r.skipped or not r.metrics:
+                    continue
+                for metric_name, value in r.metrics.items():
+                    payload[f"{metric_name}__{r.model_name}"] = value
+            if payload:
+                run.log_metrics(payload, step=step)
+
+        return run.run_id
 
 
 def build_comparison_dataframe(results: list[VersionResult]) -> pd.DataFrame:
@@ -903,10 +925,13 @@ def run_smoke_test(
             )
             results.append(result)
 
-    # After all individual (version, model) runs, log one summary run
-    # per model that records v1..v5 as a stepped metric series — gives
-    # MLflow's UI a native line-chart view per model.
-    _log_model_summary_runs(results=results, log_to_mlflow=log_to_mlflow)
+    # After the 35 individual (version, model) runs, log ONE additional
+    # "overlay" summary run that records every model's v1..v5 metric
+    # trajectory under per-model metric keys (`mae__ridge`,
+    # `mae__lightgbm`, …). Selecting all `mae__*` checkboxes in that
+    # run's Metrics tab gives MLflow's native overlaid line chart with
+    # one line per model on shared x-axis.
+    _log_overlay_summary_run(results=results, log_to_mlflow=log_to_mlflow)
 
     df = build_comparison_dataframe(results)
     df = _annotate_recommendations(
