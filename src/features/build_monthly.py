@@ -110,6 +110,19 @@ def add_monthly_rollings(
 def add_calendar_features(
     df: pd.DataFrame, ts_col: str = "period_month"
 ) -> pd.DataFrame:
+    """Add purely deterministic calendar features.
+
+    NB: we deliberately do NOT add a hardcoded LNG-shock indicator. An
+    earlier round shipped `is_lng_shock_period = (2022-01..2023-12)` but
+    those boundaries were picked AFTER observing the validation split's
+    peak_threshold (246.89 KRW/kWh) — i.e. with knowledge of which months
+    turned out to be the shock. In a walk-forward CV at, say, August 2021,
+    the model would already "know" the shock starts in 2022 — that is
+    look-ahead leakage by post-hoc feature engineering. A leak-free regime
+    proxy can be derived from `smp_rolling_*` z-scores at runtime if needed
+    (computable from lag features only), but is intentionally not added by
+    default.
+    """
     out = df.copy()
     ts = pd.to_datetime(out[ts_col])
     out["year"] = ts.dt.year
@@ -226,27 +239,33 @@ def load_smp_monthly_long(sources: list[str] | None = None) -> pd.DataFrame:
         )
     long = pd.concat(frames, ignore_index=True)
     long["period_month"] = pd.to_datetime(long["period_month"])
-    # Normalise collected_at to UTC so tz-naive (legacy) and tz-aware (new)
-    # snapshots can be ranked on the same axis. utc=True interprets tz-naive
-    # values as UTC and converts tz-aware values to UTC.
-    long["collected_at"] = pd.to_datetime(
-        long["collected_at"], utc=True, errors="coerce"
-    )
     long["source_priority"] = long["source_priority"].astype("int64")
     long["source_file_sha256"] = long["source_file_sha256"].fillna("").astype(str)
     long["parsed_path"] = long["parsed_path"].astype(str)
 
-    # Build the collected_at rank at FULL native precision (microseconds in
-    # pandas ≥ 3 by default, nanoseconds in older pandas). Do NOT divide to
-    # seconds: same-second-different-microsecond snapshots must still be
-    # distinguishable, otherwise the lexicographic sha/path tie-breaker would
-    # silently keep an older revision that happens to come first by hash.
+    # Build the collected_at rank using an INTERNAL UTC-normalised series.
+    # We deliberately do NOT overwrite long["collected_at"] with the tz-aware
+    # version: the external contract (returned dataframe + _priority_dedup_log
+    # + side-info JSON consumers) expects UTC-naive timestamps, matching the
+    # collectors that wrote them.
+    #
+    # utc=True interprets tz-naive values as UTC and converts tz-aware values
+    # to UTC, so the rank works uniformly regardless of how each parquet was
+    # written. After computing the rank we normalise long["collected_at"]
+    # back to UTC-naive for the rest of the function.
+    collected_utc = pd.to_datetime(long["collected_at"], utc=True, errors="coerce")
+    # Full native precision (microseconds in pandas ≥ 3, nanoseconds in older
+    # pandas). Do NOT divide to seconds: same-second-different-microsecond
+    # snapshots must still be distinguishable, otherwise the lexicographic
+    # sha/path tie-breaker would silently keep an older revision.
     # NaT is forced to int64.min so missing collected_at sorts LAST under
     # descending-by-rank ordering (older / unknown timing always loses).
-    collected_int = long["collected_at"].astype("int64")
+    collected_int = collected_utc.astype("int64")
     long["_collected_at_rank"] = collected_int.where(
-        long["collected_at"].notna(), other=np.iinfo(np.int64).min
+        collected_utc.notna(), other=np.iinfo(np.int64).min
     )
+    # Restore the external contract: UTC-naive collected_at.
+    long["collected_at"] = collected_utc.dt.tz_convert("UTC").dt.tz_localize(None)
     long_sorted = long.sort_values(
         by=[
             "period_month",
@@ -323,6 +342,491 @@ def load_settlement_monthly_long() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Round-3 optional loaders: capacity (yearly + monthly) + transaction
+# ---------------------------------------------------------------------------
+
+def load_capacity_monthly_by_fuel_long() -> pd.DataFrame:
+    """Monthly fuel-capacity long-format frame (already filtered to all-합계)."""
+    df = _load_one_source_parquet("kpx_capacity_monthly_by_fuel_home_file")
+    if not df.empty:
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        df = df.sort_values(["period_month", "fuel_type"]).drop_duplicates(
+            subset=["period_month", "fuel_type"], keep="last"
+        )
+    return df.reset_index(drop=True)
+
+
+def load_capacity_monthly_by_generation_type_long() -> pd.DataFrame:
+    df = _load_one_source_parquet("kpx_capacity_monthly_by_generation_type_home_file")
+    if not df.empty:
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        df = df.sort_values(
+            ["period_month", "capacity_type_canonical"]
+        ).drop_duplicates(
+            subset=["period_month", "capacity_type_canonical"], keep="last"
+        )
+    return df.reset_index(drop=True)
+
+
+def load_capacity_yearly_by_energy_source_long() -> pd.DataFrame:
+    df = _load_one_source_parquet("kpx_capacity_yearly_by_energy_source_home_file")
+    if not df.empty:
+        df = df.sort_values(
+            ["period_year", "row_category",
+             "capacity_category_level1", "capacity_category_level2"]
+        )
+    return df.reset_index(drop=True)
+
+
+def load_transaction_volume_hourly_long() -> pd.DataFrame:
+    df = _load_one_source_parquet("kpx_transaction_volume_hourly_by_fuel_file")
+    if not df.empty:
+        df["interval_end"] = pd.to_datetime(df["interval_end"])
+    return df.reset_index(drop=True)
+
+
+def load_transaction_amount_daily_long() -> pd.DataFrame:
+    df = _load_one_source_parquet("kpx_transaction_amount_daily_by_fuel_file")
+    if not df.empty:
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+    return df.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Round-3 feature-block builders (each emits a per-period_month wide table)
+# ---------------------------------------------------------------------------
+
+# Fuel sub-categories whose sum gives `renewable_total` for capacity.
+RENEWABLE_SUB_FUELS_CAPACITY = (
+    "renewable_solar", "renewable_wind", "renewable_fuel_cell",
+    "renewable_hydro", "renewable_marine", "renewable_bio",
+    "renewable_waste", "renewable_igcc",
+)
+# For transactions (different sub-fuel set because amount file has biomass etc).
+RENEWABLE_SUB_FUELS_TX = (
+    "renewable_solar", "renewable_wind", "renewable_fuel_cell",
+    "renewable_hydro", "renewable_marine", "renewable_bio",
+    "renewable_biogas", "renewable_biomass", "renewable_bio_srf",
+    "renewable_waste", "renewable_igcc",
+)
+
+
+def _pivot_fuel_wide(
+    long: pd.DataFrame,
+    value_col: str,
+    *,
+    index_col: str = "period_month",
+    fuel_col: str = "fuel_type",
+) -> pd.DataFrame:
+    """Pivot a long (period, fuel, value) frame into one row per period."""
+    if long.empty:
+        return pd.DataFrame(columns=[index_col])
+    return long.pivot_table(
+        index=index_col, columns=fuel_col, values=value_col, aggfunc="sum"
+    ).reset_index()
+
+
+def build_capacity_fuel_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """capacity_fuel_*_mw + share features, lagged 1 month and keyed on
+    period_month.
+
+    Lag 1 month is required by the no-future-leakage contract: a feature at
+    row M may only use values whose underlying period_month is strictly < M.
+    The lag also gives capacity publication time (KPX HOME data comes out
+    with a M+1 delay).
+    """
+    long = load_capacity_monthly_by_fuel_long()
+    info = {
+        "source_id": "kpx_capacity_monthly_by_fuel_home_file",
+        "feature_origin_frequency": "monthly",
+        "lag_applied": "1m",
+        "rows_in_source": int(len(long)),
+        "period_range": None,
+        "missing_periods_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+    wide = _pivot_fuel_wide(long, value_col="capacity_mw")
+    # Compute renewable_total as sum of available sub-fuels.
+    sub_cols = [c for c in RENEWABLE_SUB_FUELS_CAPACITY if c in wide.columns]
+    wide["renewable_total"] = wide[sub_cols].sum(axis=1) if sub_cols else 0.0
+    rename = {
+        "nuclear": "capacity_fuel_nuclear_mw",
+        "coal_bituminous": "capacity_fuel_coal_bituminous_mw",
+        "coal_anthracite": "capacity_fuel_coal_anthracite_mw",
+        "oil": "capacity_fuel_oil_mw",
+        "lng": "capacity_fuel_lng_mw",
+        "pumped_storage": "capacity_fuel_pumped_storage_mw",
+        "renewable_solar": "capacity_fuel_renewable_solar_mw",
+        "renewable_wind": "capacity_fuel_renewable_wind_mw",
+        "renewable_fuel_cell": "capacity_fuel_renewable_fuel_cell_mw",
+        "renewable_total": "capacity_fuel_renewable_total_mw",
+        "other": "capacity_fuel_other_mw",
+        "total": "capacity_fuel_total_mw",
+    }
+    wide = wide.rename(columns={k: v for k, v in rename.items() if k in wide.columns})
+    keep = ["period_month"] + [v for v in rename.values() if v in wide.columns]
+    current = wide[keep].copy()
+
+    total = current.get("capacity_fuel_total_mw")
+    if total is not None:
+        denom = total.where(total > 0)
+        if "capacity_fuel_nuclear_mw" in current.columns:
+            current["capacity_fuel_nuclear_share"] = current["capacity_fuel_nuclear_mw"] / denom
+        if "capacity_fuel_lng_mw" in current.columns:
+            current["capacity_fuel_lng_share"] = current["capacity_fuel_lng_mw"] / denom
+        coal_b = current.get("capacity_fuel_coal_bituminous_mw", 0)
+        coal_a = current.get("capacity_fuel_coal_anthracite_mw", 0)
+        current["capacity_fuel_coal_total_mw"] = coal_b + coal_a
+        current["capacity_fuel_coal_total_share"] = current["capacity_fuel_coal_total_mw"] / denom
+        if "capacity_fuel_renewable_total_mw" in current.columns:
+            current["capacity_fuel_renewable_total_share"] = (
+                current["capacity_fuel_renewable_total_mw"] / denom
+            )
+
+    # Apply lag_1m to ALL value columns. This satisfies the contract that
+    # row M only uses values whose period_month < M.
+    value_cols = [c for c in current.columns if c != "period_month"]
+    out = _exogenous_lag_1m(current, value_cols=value_cols)
+    info["period_range"] = (
+        str(out["period_month"].min()), str(out["period_month"].max())
+    )
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    )
+    return out, info
+
+
+def build_capacity_type_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """capacity_type_*_mw + share features, lagged 1 month."""
+    long = load_capacity_monthly_by_generation_type_long()
+    info = {
+        "source_id": "kpx_capacity_monthly_by_generation_type_home_file",
+        "feature_origin_frequency": "monthly",
+        "lag_applied": "1m",
+        "rows_in_source": int(len(long)),
+        "period_range": None,
+        "missing_periods_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+    wide = long.pivot_table(
+        index="period_month", columns="capacity_type_canonical",
+        values="capacity_mw", aggfunc="sum",
+    ).reset_index()
+    # Aggregate sub-types into the canonical groups the prompt asks for.
+    steam_cols = [c for c in
+                  ["steam_coal_bituminous", "steam_coal_anthracite",
+                   "steam_oil", "steam_gas"] if c in wide.columns]
+    combined_cols = [c for c in ["combined_oil", "combined_gas"] if c in wide.columns]
+    ic_cols = [c for c in ["internal_combustion_oil", "internal_combustion_gas"] if c in wide.columns]
+
+    current = pd.DataFrame({"period_month": wide["period_month"]})
+    if "nuclear" in wide.columns:
+        current["capacity_type_nuclear_mw"] = wide["nuclear"]
+    if steam_cols:
+        current["capacity_type_steam_total_mw"] = wide[steam_cols].sum(axis=1)
+    if combined_cols:
+        current["capacity_type_combined_cycle_total_mw"] = wide[combined_cols].sum(axis=1)
+    if ic_cols:
+        current["capacity_type_internal_combustion_total_mw"] = wide[ic_cols].sum(axis=1)
+    if "pumped_storage" in wide.columns:
+        current["capacity_type_pumped_storage_mw"] = wide["pumped_storage"]
+    if "renewable" in wide.columns:
+        current["capacity_type_renewable_mw"] = wide["renewable"]
+    if "total" in wide.columns:
+        current["capacity_type_total_mw"] = wide["total"]
+
+    total = current.get("capacity_type_total_mw")
+    if total is not None:
+        denom = total.where(total > 0)
+        if "capacity_type_nuclear_mw" in current.columns:
+            current["capacity_type_nuclear_share"] = current["capacity_type_nuclear_mw"] / denom
+        if "capacity_type_combined_cycle_total_mw" in current.columns:
+            current["capacity_type_combined_cycle_share"] = (
+                current["capacity_type_combined_cycle_total_mw"] / denom
+            )
+        if "capacity_type_renewable_mw" in current.columns:
+            current["capacity_type_renewable_share"] = (
+                current["capacity_type_renewable_mw"] / denom
+            )
+
+    value_cols = [c for c in current.columns if c != "period_month"]
+    out = _exogenous_lag_1m(current, value_cols=value_cols)
+    info["period_range"] = (
+        str(out["period_month"].min()), str(out["period_month"].max())
+    )
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    )
+    return out, info
+
+
+def build_capacity_yearly_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """Broadcast yearly totals using a 1-year LAG (period_month.year - 1).
+
+    The no-future-leakage contract requires that a row M only see values
+    whose source period is strictly < M. Yearly aggregates for year Y are
+    only published after Y ends (typically Q1 of Y+1), so for any month in
+    year Y we use the year Y-1 capacity total. Feature names carry an
+    explicit ``_lag_1y`` suffix so downstream readers know the lag.
+    """
+    long = load_capacity_yearly_by_energy_source_long()
+    info = {
+        "source_id": "kpx_capacity_yearly_by_energy_source_home_file",
+        "feature_origin_frequency": "yearly_broadcast",
+        "lag_applied": "1y",
+        "rows_in_source": int(len(long)),
+        "years_available": [],
+        "missing_years_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+    totals = long[long["row_category"] == "총계"].copy()
+    if totals.empty:
+        totals = long.copy()
+    by_year = totals.groupby(
+        ["period_year", "capacity_category_level1", "capacity_category_level2"],
+        as_index=False,
+    )["capacity_mw"].sum()
+    by_year["category_key"] = (
+        by_year["capacity_category_level1"]
+        + by_year["capacity_category_level2"].map(lambda s: f"|{s}" if s else "")
+    )
+    wide = by_year.pivot_table(
+        index="period_year", columns="category_key",
+        values="capacity_mw", aggfunc="sum",
+    ).reset_index()
+
+    rename = {
+        "원자력": "capacity_yearly_nuclear_mw_lag_1y",
+        "신재생": "capacity_yearly_renewable_mw_lag_1y",
+        "총계": "capacity_yearly_total_mw_lag_1y",
+        "기력|계": "capacity_yearly_steam_total_mw_lag_1y",
+        "복합화력|계": "capacity_yearly_combined_total_mw_lag_1y",
+    }
+    wide = wide.rename(columns={k: v for k, v in rename.items() if k in wide.columns})
+    keep = ["period_year"] + [v for v in rename.values() if v in wide.columns]
+    wide = wide[keep].copy()
+
+    info["years_available"] = sorted(int(y) for y in wide["period_year"].unique())
+    smp_years_minus_one = (period_months.dt.year - 1).unique()
+    info["missing_years_in_smp_index"] = int(
+        sum(y not in info["years_available"] for y in smp_years_minus_one)
+    )
+
+    # Broadcast with a 1-year LAG: month in year Y maps to yearly capacity of Y-1.
+    out = pd.DataFrame({"period_month": period_months.drop_duplicates()})
+    out["_lookup_year"] = out["period_month"].dt.year - 1
+    out = out.merge(wide, left_on="_lookup_year", right_on="period_year", how="left")
+    out = out.drop(columns=["_lookup_year", "period_year"])
+    return out, info
+
+
+def build_transaction_volume_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """Hourly → monthly aggregation, then 1-month lag; emits volume MWh
+    per fuel + shares (all with ``_lag_1m`` suffix).
+
+    Monthly aggregation uses ``trade_date`` rather than ``interval_end``: the
+    vendor reports trade_date as the physical-flow day, so trade_hour=24 of
+    the last day of a month must stay in that month's bucket — under
+    interval_end semantics it would silently spill into the next month.
+    """
+    long = load_transaction_volume_hourly_long()
+    info = {
+        "source_id": "kpx_transaction_volume_hourly_by_fuel_file",
+        "feature_origin_frequency": "hourly_aggregated_to_monthly",
+        "lag_applied": "1m",
+        "monthly_aggregation_key": "trade_date",
+        "market_participating_generators_only": True,
+        "rows_in_source": int(len(long)),
+        "period_range": None,
+        "missing_periods_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+    long = long.copy()
+    long["period_month"] = (
+        long["trade_date"].dt.to_period("M").dt.to_timestamp()
+    )
+    wide = _pivot_fuel_wide(long, value_col="transaction_volume_mwh")
+    sub_cols = [c for c in RENEWABLE_SUB_FUELS_TX if c in wide.columns]
+    wide["renewable_total"] = wide[sub_cols].sum(axis=1) if sub_cols else 0.0
+    rename = {
+        "nuclear": "transaction_volume_nuclear_mwh",
+        "lng": "transaction_volume_lng_mwh",
+        "coal_bituminous": "transaction_volume_coal_bituminous_mwh",
+        "coal_anthracite": "transaction_volume_coal_anthracite_mwh",
+        "oil": "transaction_volume_oil_mwh",
+        "renewable": "transaction_volume_renewable_singlecol_mwh",
+        "renewable_total": "transaction_volume_renewable_total_mwh",
+    }
+    wide = wide.rename(columns={k: v for k, v in rename.items() if k in wide.columns})
+    keep_base = [v for v in rename.values() if v in wide.columns]
+    wide["transaction_volume_total_mwh"] = wide[keep_base].sum(axis=1, min_count=1)
+    keep = ["period_month"] + keep_base + ["transaction_volume_total_mwh"]
+    current = wide[keep].copy()
+
+    total = current["transaction_volume_total_mwh"]
+    denom = total.where(total > 0)
+    for fcol, scol in [
+        ("transaction_volume_nuclear_mwh", "transaction_volume_nuclear_share"),
+        ("transaction_volume_lng_mwh", "transaction_volume_lng_share"),
+        ("transaction_volume_renewable_total_mwh", "transaction_volume_renewable_share"),
+    ]:
+        if fcol in current.columns:
+            current[scol] = current[fcol] / denom
+    coal_b = current.get("transaction_volume_coal_bituminous_mwh", 0)
+    coal_a = current.get("transaction_volume_coal_anthracite_mwh", 0)
+    current["transaction_volume_coal_total_mwh"] = coal_b + coal_a
+    current["transaction_volume_coal_total_share"] = (
+        current["transaction_volume_coal_total_mwh"] / denom
+    )
+
+    value_cols = [c for c in current.columns if c != "period_month"]
+    out = _exogenous_lag_1m(current, value_cols=value_cols)
+    info["period_range"] = (
+        str(out["period_month"].min()), str(out["period_month"].max())
+    )
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    )
+    return out, info
+
+
+def build_transaction_amount_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """Daily → monthly aggregation (by trade_date) → 1-month lag.
+
+    Aggregation uses trade_date directly (no boundary ambiguity for daily
+    data); the result then gets ``_lag_1m`` applied for no-future-leakage.
+    """
+    long = load_transaction_amount_daily_long()
+    info = {
+        "source_id": "kpx_transaction_amount_daily_by_fuel_file",
+        "feature_origin_frequency": "daily_aggregated_to_monthly",
+        "lag_applied": "1m",
+        "monthly_aggregation_key": "trade_date",
+        "market_participating_generators_only": True,
+        "rows_in_source": int(len(long)),
+        "period_range": None,
+        "missing_periods_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+    long = long.copy()
+    long["period_month"] = (
+        long["trade_date"].dt.to_period("M").dt.to_timestamp()
+    )
+    wide = _pivot_fuel_wide(long, value_col="transaction_amount_krw")
+    sub_cols = [c for c in RENEWABLE_SUB_FUELS_TX if c in wide.columns]
+    wide["renewable_total"] = wide[sub_cols].sum(axis=1) if sub_cols else 0.0
+    rename = {
+        "nuclear": "transaction_amount_nuclear_krw",
+        "lng": "transaction_amount_lng_krw",
+        "coal_bituminous": "transaction_amount_coal_bituminous_krw",
+        "coal_anthracite": "transaction_amount_coal_anthracite_krw",
+        "oil": "transaction_amount_oil_krw",
+        "renewable_total": "transaction_amount_renewable_total_krw",
+    }
+    wide = wide.rename(columns={k: v for k, v in rename.items() if k in wide.columns})
+    keep_base = [v for v in rename.values() if v in wide.columns]
+    wide["transaction_amount_total_krw"] = wide[keep_base].sum(axis=1, min_count=1)
+    keep = ["period_month"] + keep_base + ["transaction_amount_total_krw"]
+    current = wide[keep].copy()
+    total = current["transaction_amount_total_krw"]
+    denom = total.where(total > 0)
+    for fcol, scol in [
+        ("transaction_amount_nuclear_krw", "transaction_amount_nuclear_share"),
+        ("transaction_amount_lng_krw", "transaction_amount_lng_share"),
+        ("transaction_amount_renewable_total_krw", "transaction_amount_renewable_share"),
+    ]:
+        if fcol in current.columns:
+            current[scol] = current[fcol] / denom
+    coal_b = current.get("transaction_amount_coal_bituminous_krw", 0)
+    coal_a = current.get("transaction_amount_coal_anthracite_krw", 0)
+    current["transaction_amount_coal_total_krw"] = coal_b + coal_a
+    current["transaction_amount_coal_total_share"] = (
+        current["transaction_amount_coal_total_krw"] / denom
+    )
+
+    value_cols = [c for c in current.columns if c != "period_month"]
+    out = _exogenous_lag_1m(current, value_cols=value_cols)
+    info["period_range"] = (
+        str(out["period_month"].min()), str(out["period_month"].max())
+    )
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    )
+    return out, info
+
+
+def build_transaction_price_features(
+    volume_feats: pd.DataFrame, amount_feats: pd.DataFrame
+) -> tuple[pd.DataFrame, dict]:
+    """Compute KRW/kWh approximations from monthly amount ÷ volume.
+
+    Both inputs are already 1-month-lagged (per the no-future-leakage
+    contract), so dividing them gives a 1-month-lagged unit price too —
+    feature names carry the explicit ``_lag_1m`` suffix.
+
+    ONLY runs on (period_month) months that appear in BOTH inputs; if there
+    is no overlap, returns an empty frame and a warning info dict.
+    """
+    info = {
+        "overlap_months": 0,
+        "warning": None,
+        "lag_applied": "1m",
+    }
+    if volume_feats.empty or amount_feats.empty:
+        info["warning"] = "missing_volume_or_amount_data"
+        return pd.DataFrame(columns=["period_month"]), info
+    # NB: volume_feats and amount_feats have ALREADY been lag_1m'd by their
+    # respective builders. After lag_1m, _exogenous_lag_1m's `_reindex_monthly`
+    # produces a value at row M whose source is M-1. Two `period_month=M` rows
+    # with both having non-NaN values means BOTH M-1 source aggregates exist.
+    vol_nonnull = volume_feats.dropna(how="all", subset=[
+        c for c in volume_feats.columns if c != "period_month"
+    ])
+    amt_nonnull = amount_feats.dropna(how="all", subset=[
+        c for c in amount_feats.columns if c != "period_month"
+    ])
+    overlap = (
+        set(vol_nonnull["period_month"]) & set(amt_nonnull["period_month"])
+    )
+    info["overlap_months"] = len(overlap)
+    if not overlap:
+        info["warning"] = (
+            "no_overlap_between_transaction_volume_and_amount: "
+            "skipped price feature creation"
+        )
+        return pd.DataFrame(columns=["period_month"]), info
+    merged = volume_feats.merge(amount_feats, on="period_month", how="inner")
+    pairs = [
+        ("lng",
+         "transaction_amount_lng_krw_lag_1m", "transaction_volume_lng_mwh_lag_1m",
+         "market_trade_price_lng_krw_per_kwh_lag_1m"),
+        ("coal_total",
+         "transaction_amount_coal_total_krw_lag_1m",
+         "transaction_volume_coal_total_mwh_lag_1m",
+         "market_trade_price_coal_total_krw_per_kwh_lag_1m"),
+        ("nuclear",
+         "transaction_amount_nuclear_krw_lag_1m",
+         "transaction_volume_nuclear_mwh_lag_1m",
+         "market_trade_price_nuclear_krw_per_kwh_lag_1m"),
+        ("renewable",
+         "transaction_amount_renewable_total_krw_lag_1m",
+         "transaction_volume_renewable_total_mwh_lag_1m",
+         "market_trade_price_renewable_krw_per_kwh_lag_1m"),
+    ]
+    out = pd.DataFrame({"period_month": merged["period_month"]})
+    for _name, amt, vol, feat in pairs:
+        if amt in merged.columns and vol in merged.columns:
+            vol_safe = merged[vol].where(merged[vol] > 0)
+            out[feat] = (merged[amt] / vol_safe) / 1000.0
+    return out, info
+
+
+# ---------------------------------------------------------------------------
 # Wide pivot for one area
 # ---------------------------------------------------------------------------
 
@@ -354,6 +858,14 @@ def _exogenous_lag_1m(
     independent) and reindexes to a contiguous month-start grid before
     shifting so gaps become NaN instead of silently joining to the previous
     available month.
+
+    The reindex grid is extended by ONE month past the source's last month,
+    so the lag of the newest source observation gets exposed at
+    ``source_max + 1 month``. Without that extension, the newest source
+    value would never appear in any output row (it would be the lag at
+    ``source_max + 1`` which would not exist) — that drops genuinely fresh
+    data on the floor and was the root cause of optional capacity/
+    transaction lag features missing their most recent month.
     """
     lag_cols = [f"{c}_lag_1m" for c in value_cols]
     if df.empty or not value_cols:
@@ -364,7 +876,11 @@ def _exogenous_lag_1m(
         work.groupby(ts_col, as_index=False, sort=True)[value_cols]
         .mean(numeric_only=True)
     )
-    full = pd.date_range(work[ts_col].min(), work[ts_col].max(), freq="MS")
+    full = pd.date_range(
+        work[ts_col].min(),
+        work[ts_col].max() + pd.DateOffset(months=1),
+        freq="MS",
+    )
     work = work.set_index(ts_col).reindex(full)
     work.index.name = ts_col
     for col in value_cols:
@@ -397,11 +913,19 @@ def build_smp_monthly_features(
     horizon_months: int = 1,
     target_col: str = "target_smp_t_plus_h_months",
     include_settlement: bool = True,
+    include_capacity: bool = True,
+    include_transaction: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """Build monthly features for a single area.
 
     Returns the feature dataframe AND a side-info dict useful for the DQ
-    report (priority dedup decisions, settlement fuel coverage).
+    report (priority dedup decisions, settlement fuel coverage, optional
+    capacity/transaction join metadata).
+
+    Optional capacity/transaction features are joined AFTER the baseline
+    dropna so that they NEVER change the row count of the feature table
+    (per the Codex no-overwrite + row-count invariant contract). Missing
+    optional values surface as NaN columns.
     """
     smp_long = load_smp_monthly_long()
     wide = _smp_wide_for_area(smp_long, area)
@@ -434,20 +958,120 @@ def build_smp_monthly_features(
         raise ValueError("horizon_months must be > 0")
     feats[target_col] = feats["smp_krw_per_kwh"].shift(-horizon_months)
 
-    feature_cols = [
+    # Expose the current-month SMP as a feature under a distinct name. At
+    # row M, smp_krw_per_kwh is SMP at M — observed before we forecast M+1,
+    # so it is NOT leakage to use it. Excluding it (as the original builder
+    # did) forces the "naive" models to lean on smp_lag_1m (= SMP at M-1),
+    # which makes naive_lag_1m look like a 2-step seasonal lag instead of a
+    # true persistence baseline. We add it under an explicit name so it
+    # cannot accidentally collide with the smp_krw_per_kwh column the
+    # builder reserves as the raw target source.
+    feats["smp_t_observed"] = feats["smp_krw_per_kwh"]
+
+    # Baseline (required) feature_cols — these decide which rows survive dropna.
+    # smp_krw_per_kwh stays excluded (it is the "raw target source", duplicated
+    # into smp_t_observed for downstream features); the rest is open game.
+    baseline_feature_cols = [
         c for c in feats.columns
         if c not in {target_col, "period_month", "area", "smp_krw_per_kwh"}
         and feats[c].dtype != object
     ]
-    feats = feats.dropna(subset=feature_cols + [target_col]).reset_index(drop=True)
-    _assert_monthly_no_leakage(feats, target_col=target_col, feature_cols=feature_cols)
+    feats = feats.dropna(subset=baseline_feature_cols + [target_col]).reset_index(drop=True)
+    n_baseline_rows = len(feats)
+
+    # ---- Optional capacity/transaction joins (must preserve row count) -----
+    optional_info: dict = {}
+    if include_capacity:
+        cap_fuel_feats, cap_fuel_info = build_capacity_fuel_features(feats["period_month"])
+        cap_type_feats, cap_type_info = build_capacity_type_features(feats["period_month"])
+        cap_yr_feats, cap_yr_info = build_capacity_yearly_features(feats["period_month"])
+        for block in (cap_fuel_feats, cap_type_feats, cap_yr_feats):
+            if not block.empty:
+                # Deduplicate on period_month so left-join can't fan-out rows.
+                block = block.drop_duplicates(subset=["period_month"], keep="last")
+                feats = feats.merge(block, on="period_month", how="left")
+        optional_info["capacity_fuel"] = cap_fuel_info
+        optional_info["capacity_type"] = cap_type_info
+        optional_info["capacity_yearly"] = cap_yr_info
+
+    tx_volume_block: pd.DataFrame | None = None
+    tx_amount_block: pd.DataFrame | None = None
+    if include_transaction:
+        tx_volume_block, tx_volume_info = build_transaction_volume_features(
+            feats["period_month"]
+        )
+        tx_amount_block, tx_amount_info = build_transaction_amount_features(
+            feats["period_month"]
+        )
+        for block in (tx_volume_block, tx_amount_block):
+            if not block.empty:
+                block = block.drop_duplicates(subset=["period_month"], keep="last")
+                feats = feats.merge(block, on="period_month", how="left")
+        # Price feature is conditional on overlap.
+        price_block, price_info = build_transaction_price_features(
+            tx_volume_block, tx_amount_block
+        )
+        if not price_block.empty:
+            price_block = price_block.drop_duplicates(subset=["period_month"], keep="last")
+            feats = feats.merge(price_block, on="period_month", how="left")
+        optional_info["transaction_volume"] = tx_volume_info
+        optional_info["transaction_amount"] = tx_amount_info
+        optional_info["transaction_price"] = price_info
+
+    # Hard invariant: optional joins must NOT change the SMP row count.
+    if len(feats) != n_baseline_rows:
+        raise AssertionError(
+            f"Optional feature joins changed row count: "
+            f"baseline={n_baseline_rows} after_joins={len(feats)}. "
+            "Check for duplicate period_month keys in capacity/transaction sources."
+        )
+
+    # ---- Forecast-origin metadata --------------------------------------
+    # Explicit per-row metadata that documents the forecast contract:
+    #   forecast_origin_month: the month after which the prediction is made
+    #     (= period_month — features at this row are derived from
+    #     observations whose period_month is ≤ this).
+    #   target_month: the month the prediction refers to
+    #     (= period_month + horizon_months).
+    #   information_cutoff: the last instant of observable information
+    #     (end-of-day for the last day of forecast_origin_month).
+    #   horizon: human-readable horizon descriptor (e.g. "1M").
+    # These columns are NOT used as model features (they would either be
+    # constant or trivially derived from period_month) but are written
+    # alongside every prediction row so downstream consumers can answer
+    # "this prediction was made when, for what month?".
+    feats["forecast_origin_month"] = feats["period_month"]
+    feats["target_month"] = feats["period_month"] + pd.DateOffset(months=horizon_months)
+    # information_cutoff = month-end of period_month, at 23:59:59.
+    feats["information_cutoff"] = (
+        feats["period_month"]
+        + pd.offsets.MonthEnd(0)
+        + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    )
+    feats["horizon"] = f"{horizon_months}M"
+
+    # Forecast-metadata columns are NOT features (they are bookkeeping
+    # only). Exclude them explicitly so a future dtype tweak can't sneak
+    # them into the model input.
+    _forecast_meta_cols = {
+        "forecast_origin_month", "target_month", "information_cutoff", "horizon",
+    }
+    feature_cols = [
+        c for c in feats.columns
+        if c not in {target_col, "period_month", "area", "smp_krw_per_kwh"}
+        and c not in _forecast_meta_cols
+        and feats[c].dtype != object
+    ]
+    _assert_monthly_no_leakage(feats, target_col=target_col, feature_cols=baseline_feature_cols)
 
     side_info = {
         "area": area,
         "rows": int(len(feats)),
         "feature_cols": feature_cols,
+        "baseline_feature_cols": baseline_feature_cols,
         "settlement_fuels": sorted(settlement_fuels),
         "smp_priority_dedup_log": smp_long.attrs.get("_priority_dedup_log"),
+        "optional_join_info": optional_info,
     }
     return feats, side_info
 

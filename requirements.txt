@@ -21,3 +21,22 @@ pytest-cov>=5.0
 # psycopg[binary]>=3.1
 # xgboost>=2.0
 # statsmodels>=0.14
+
+# Static-plot snapshots for the baseline comparison flow
+# (`src/pipelines/save_baseline_plots.py`). matplotlib is also pulled in
+# transitively by some streamlit/altair installs but we pin it here so the
+# snapshot script works on minimal installs too.
+matplotlib>=3.8,<4.0
+
+# Dashboard (streamlit-based read-only viewer; see `dashboard.py`).
+#
+# Lower bound 1.57: the dashboard calls `st.dataframe(width="stretch")` and
+# `st.plotly_chart(width="stretch")`. Earlier 1.x releases either don't accept
+# the literal "stretch" value or accept it inconsistently across elements;
+# 1.57 is the version this repo was developed and smoke-tested against.
+# Upper bound <2: streamlit and plotly both ship breaking changes across
+# major versions (e.g. streamlit 1.40+ deprecated `use_container_width`),
+# so leaving the upper bound open would invite silent runtime breakage on
+# the next major release.
+streamlit>=1.57,<2.0
+plotly>=6.0,<7.0

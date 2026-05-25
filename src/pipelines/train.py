@@ -24,10 +24,13 @@ from src.models.metrics import compute_metrics
 from src.models.naive import (
     NaiveLag1m,
     NaiveLag24h,
+    PersistenceMonthly,
     SeasonalNaiveLag12m,
     SeasonalNaiveLag168h,
 )
 from src.models.ridge_model import RidgeModel
+from src.models.ar_monthly import MonthlyARRidge
+from src.models.delta_models import DeltaARRidge, DeltaLightGBM, DeltaRidge
 from src.utils.logging import get_logger
 
 app = typer.Typer(help="Train SMP forecasting models.")
@@ -35,10 +38,18 @@ app = typer.Typer(help="Train SMP forecasting models.")
 MODELS = {
     "naive": NaiveLag24h,                  # hourly
     "seasonal_naive": SeasonalNaiveLag168h,
-    "naive_lag_1m": NaiveLag1m,            # monthly
+    "naive_lag_1m": NaiveLag1m,            # monthly: SMP(M+1) ≈ SMP(M-1) (2-step lag)
+    "persistence_monthly": PersistenceMonthly,   # monthly: SMP(M+1) ≈ SMP(M) (true naive)
     "seasonal_naive_lag_12m": SeasonalNaiveLag12m,
     "ridge": RidgeModel,
     "lightgbm": LightGBMModel,
+    "monthly_ar_ridge": MonthlyARRidge,    # monthly: lag_1m + rolling_3m + lag_12m
+    # Delta-target wrappers: learn y_delta = target − smp_t_observed, then
+    # reconstruct as smp_t_observed + predicted_delta. Lets the model focus
+    # on the residual on top of the persistence baseline.
+    "delta_ridge": DeltaRidge,
+    "delta_lightgbm": DeltaLightGBM,
+    "delta_ar_ridge": DeltaARRidge,
 }
 
 
@@ -110,14 +121,44 @@ def main(
             return {}
         preds = model_obj.predict(split[feature_cols])
         metrics = compute_metrics(split[target], preds).to_dict()
-        out = pd.DataFrame(
-            {
-                timestamp_col: split[timestamp_col].values,
-                "area": split.get("area", pd.Series(["mainland"] * len(split))).values,
-                "y_true": split[target].values,
-                "y_pred": preds.values,
-            }
-        )
+
+        # Pull forecast-origin metadata if the feature pipeline added it.
+        # These were added in round 5 to make the forecast contract explicit
+        # (what month is being predicted, what was knowable when).
+        meta_cols = ["forecast_origin_month", "target_month",
+                     "information_cutoff", "horizon"]
+        out_dict = {
+            timestamp_col: split[timestamp_col].values,
+            "area": split.get("area", pd.Series(["mainland"] * len(split))).values,
+            "y_true": split[target].values,
+            "y_pred": preds.values,
+        }
+        for c in meta_cols:
+            if c in split.columns:
+                out_dict[c] = split[c].values
+
+        # Delta-target diagnostics: when smp_t_observed is in features AND
+        # the model exposes predict_delta, compute the delta-MAE and the
+        # sign-agreement of the predicted delta. We compute the same delta
+        # info even for non-delta models so the columns are comparable
+        # across the whole MODELS table.
+        if "smp_t_observed" in split.columns:
+            obs = split["smp_t_observed"].to_numpy(dtype=float)
+            true_delta = split[target].to_numpy(dtype=float) - obs
+            pred_delta = preds.to_numpy(dtype=float) - obs
+            out_dict["smp_t_observed"] = obs
+            out_dict["true_delta_1m"] = true_delta
+            out_dict["predicted_delta_1m"] = pred_delta
+            import numpy as np
+            metrics["delta_mae"] = float(np.mean(np.abs(true_delta - pred_delta)))
+            sign_mask = true_delta != 0
+            metrics["delta_direction_accuracy"] = (
+                float((np.sign(true_delta[sign_mask])
+                       == np.sign(pred_delta[sign_mask])).mean())
+                if sign_mask.any() else float("nan")
+            )
+
+        out = pd.DataFrame(out_dict)
         out.to_csv(out_dir / f"predictions_{name}.csv", index=False)
         return metrics
 

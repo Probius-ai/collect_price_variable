@@ -5,6 +5,217 @@ defaults:
   request_timeout_seconds: 30
   timezone: Asia/Seoul
 file_sources:
+  kpx_capacity_yearly_by_energy_source_home_file:
+    column_mapping:
+      row_category: 구분
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: HOME_발전설비_연도별_에너지원별*.csv
+    frequency: yearly
+    header_rows:
+    - 0
+    - 1
+    last_verified_at: '2026-05-25'
+    limitations:
+    - Yearly snapshot — capacity values are end-of-year (vendor unspecified, treat
+      as static for the calendar year).
+    - Year is parsed from filename via regex '\((\d{4})\)' — not from the file
+      content. Files without a year in the filename will fail.
+    - Row 0 has merged level1 headers (수력/기력/복합화력/원자력/신재생/집단/내연력/기타/총계);
+      row 1 has level2 sub-categories. Loader flattens via 'level1|level2'.
+    - Row category column ("구분") changes shape across years (2024 starts with 총계;
+      earlier years start with 양수 etc). Loader preserves all rows; downstream
+      builders must filter by row_category as needed.
+    - Capacity values exclude 구역전기사업설비 and 자가용전기설비 per vendor.
+    official_name: HOME 발전설비 연도별 에너지원별
+    period_from_filename_regex: \((\d{4})\)
+    schema_version: 1
+    source_id: kpx_capacity_yearly_by_energy_source_home_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15046155/fileData.do
+    unit: MW
+  kpx_capacity_monthly_by_fuel_home_file:
+    column_mapping:
+      business_type: 사업구분
+      dispatch_type: 급전방식
+      member_type: 회원구분
+      period: 기간
+      region: 지역
+    default_filters:
+      business_type: 합계
+      dispatch_type: 합계
+      member_type: 합계
+      region: 합계
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: HOME_발전설비_연료원별.csv
+    frequency: monthly
+    fuel_type_mapping:
+      LNG: lng
+      기타: other
+      무연탄: coal_anthracite
+      신재생|바이오: renewable_bio
+      신재생|석탄가스화: renewable_igcc
+      신재생|수력: renewable_hydro
+      신재생|연료전지: renewable_fuel_cell
+      신재생|태양: renewable_solar
+      신재생|폐기물: renewable_waste
+      신재생|풍력: renewable_wind
+      신재생|해양: renewable_marine
+      양수: pumped_storage
+      원자력: nuclear
+      유류: oil
+      유연탄: coal_bituminous
+      합계: total
+    header_rows:
+    - 0
+    - 1
+    last_verified_at: '2026-05-25'
+    limitations:
+    - MVP uses only (회원구분=합계, 급전방식=합계, 사업구분=합계, 지역=합계) rows;
+      area- or member-level breakdowns are dropped during canonical filtering.
+    - 신재생 (renewable) has no aggregate column — renewable_total is computed as
+      the sum of renewable_* sub-fuels in the feature builder, not the loader.
+    - Capacity values exclude 구역전기사업설비 and 자가용전기설비 per vendor.
+    official_name: HOME 발전설비 연료원별 (월별)
+    period_format: '%Y/%m'
+    schema_version: 1
+    source_id: kpx_capacity_monthly_by_fuel_home_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15046115/fileData.do
+    unit: MW
+  kpx_capacity_monthly_by_generation_type_home_file:
+    column_mapping:
+      business_type: 사업구분
+      dispatch_type: 급전방식
+      member_type: 회원구분
+      period: 기간
+      region: 지역
+    default_filters:
+      business_type: 합계
+      dispatch_type: 합계
+      member_type: 합계
+      region: 합계
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: HOME_발전설비_발전형식별.csv
+    frequency: monthly
+    generation_type_mapping:
+      기력|가스: steam_gas
+      기력|무연탄: steam_coal_anthracite
+      기력|유류: steam_oil
+      기력|유연탄: steam_coal_bituminous
+      내연력|가스: internal_combustion_gas
+      내연력|유류: internal_combustion_oil
+      복합화력|가스: combined_gas
+      복합화력|유류: combined_oil
+      신재생: renewable
+      양수: pumped_storage
+      원자력: nuclear
+      기타: other
+      합계: total
+    header_rows:
+    - 0
+    - 1
+    last_verified_at: '2026-05-25'
+    limitations:
+    - MVP uses only (회원구분=합계, 급전방식=합계, 사업구분=합계, 지역=합계) rows.
+    - 'Generation type taxonomy differs from kpx_capacity_monthly_by_fuel_home_file:
+      do NOT join capacity_type_* with capacity_fuel_* under the same canonical name.'
+    - Capacity values exclude 구역전기사업설비 and 자가용전기설비 per vendor.
+    official_name: HOME 발전설비 발전형식별 (월별)
+    period_format: '%Y/%m'
+    schema_version: 1
+    source_id: kpx_capacity_monthly_by_generation_type_home_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15046116/fileData.do
+    unit: MW
+  kpx_transaction_amount_daily_by_fuel_file:
+    column_mapping:
+      fuel_name: 연료원
+      trade_date: 거래일
+      transaction_amount_krw: 전력거래금액(원)
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: 한국전력거래소_연료원별 일별 전력거래금액.csv
+    frequency: daily
+    fuel_type_mapping:
+      LNG: lng
+      기타: other
+      무연탄: coal_anthracite
+      바이오SRF: renewable_bio_srf
+      바이오가스: renewable_biogas
+      바이오매스: renewable_biomass
+      수력: renewable_hydro
+      양수: pumped_storage
+      연료전지: renewable_fuel_cell
+      원자력: nuclear
+      유류: oil
+      유연탄: coal_bituminous
+      태양광: renewable_solar
+      풍력: renewable_wind
+      폐기물: renewable_waste
+      해양: renewable_marine
+    header_row: 0
+    header_rows: null
+    last_verified_at: '2026-05-25'
+    limitations:
+    - Vendor file column is named '전력거래금액(원)' → unit is KRW. Some data.go.kr
+      description pages mislabel this as MWh; the file header takes precedence.
+    - Only market-participating generators (PPA/BTM excluded).
+    - Subject to revision (수정정산) — newer snapshots supersede older ones via
+      revision dedup policy.
+    official_name: 한국전력거래소 연료원별 일별 전력거래금액
+    schema_version: 1
+    source_id: kpx_transaction_amount_daily_by_fuel_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15153665/fileData.do
+    trade_date_format: '%Y-%m-%d'
+    unit: KRW
+  kpx_transaction_volume_hourly_by_fuel_file:
+    column_mapping:
+      fuel_name: 연료원
+      trade_date: 거래일
+      trade_hour: 거래시간
+      transaction_volume_mwh: 전력거래량(MWh)
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: cp949
+    file_format: csv
+    filename_glob: 한국전력거래소_연료원별 전력거래량_*.csv
+    frequency: hourly
+    fuel_type_mapping:
+      LNG: lng
+      기타: other
+      무연탄: coal_anthracite
+      신재생: renewable
+      양수: pumped_storage
+      원자력: nuclear
+      유류: oil
+      유연탄: coal_bituminous
+    header_row: 0
+    header_rows: null
+    last_verified_at: '2026-05-25'
+    limitations:
+    - trade_hour 1..24 maps to interval_end (date, hour:00). trade_hour=24
+      maps to (date+1, 00:00) — consistent with the SMP hour convention.
+    - Only market-participating generators (PPA/BTM excluded).
+    - Subject to revision (수정정산); see revision dedup policy.
+    official_name: 한국전력거래소 연료원별 전력거래량 (시간대별)
+    schema_version: 1
+    source_id: kpx_transaction_volume_hourly_by_fuel_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15081098/fileData.do
+    trade_date_format: '%Y-%m-%d'
+    unit: MWh
   kpx_generation_yearly:
     candidate_source_id: kpx_generation_yearly
     encoding: cp949

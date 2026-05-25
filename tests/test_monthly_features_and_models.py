@@ -104,6 +104,33 @@ def test_exogenous_lag_returns_nan_across_missing_months():
     assert pd.isna(out.loc["2024-04-01", "settlement_unit_price_avg_lag_1m"])
 
 
+def test_exogenous_lag_exposes_newest_source_month_at_plus_one():
+    """The lag output's reindex grid extends one month past the source max so
+    the newest source observation is visible as the lag at ``source_max + 1``.
+
+    Regression for the Codex finding 'lagged optional features drop the
+    newest source month': without the +1 extension, the most recent capacity
+    or transaction snapshot would never appear in any output row because
+    its lag-position would fall outside the original reindex bounds.
+    """
+    df = pd.DataFrame(
+        {
+            "period_month": pd.to_datetime(["2024-01-01", "2024-02-01", "2024-03-01"]),
+            "settlement_unit_price_avg": [100.0, 110.0, 130.0],
+        }
+    )
+    out = _exogenous_lag_1m(df, value_cols=["settlement_unit_price_avg"]).set_index(
+        "period_month"
+    )
+    # Source max is 2024-03; its value (130.0) must surface as the lag at
+    # 2024-04 — i.e. the output grid extends one month past source max.
+    assert pd.Timestamp("2024-04-01") in out.index, (
+        "Output grid must extend one month past source max so the newest "
+        "source observation gets exposed as the +1 month lag."
+    )
+    assert out.loc["2024-04-01", "settlement_unit_price_avg_lag_1m"] == 130.0
+
+
 def test_exogenous_lag_aggregates_duplicate_year_months_deterministically():
     """Round-1 regression: duplicates are aggregated by mean, order-independent."""
     base = pd.DataFrame(
@@ -257,7 +284,7 @@ def test_revision_dedup_prefers_newer_collected_at(tmp_path, monkeypatch):
     )
     assert selected["source_file_sha256"] == "b" * 64
     assert "v2" in selected["source_file"]
-    assert selected["collected_at"] == pd.Timestamp("2026-05-01T09:30:00", tz="UTC")
+    assert selected["collected_at"] == pd.Timestamp("2026-05-01T09:30:00")
 
     log = long.attrs["_priority_dedup_log"]
     sel_rows = log[(log["area"] == "mainland") & (log["role"] == "selected")]
@@ -269,7 +296,7 @@ def test_revision_dedup_prefers_newer_collected_at(tmp_path, monkeypatch):
         "The older value must be recorded as the dropped candidate"
     )
     assert drop_rows.iloc[0]["source_file_sha256"] == "a" * 64
-    assert drop_rows.iloc[0]["collected_at"] == pd.Timestamp("2026-04-01T12:00:00", tz="UTC")
+    assert drop_rows.iloc[0]["collected_at"] == pd.Timestamp("2026-04-01T12:00:00")
     assert drop_rows.iloc[0]["reason"] == "older_revision"
 
 
@@ -342,12 +369,88 @@ def test_revision_dedup_uses_sub_second_precision(tmp_path, monkeypatch):
         "would otherwise pick the older row."
     )
     assert selected["source_file_sha256"] == "z" * 64
-    assert selected["collected_at"] == newer_ts
+    # External contract: collected_at is UTC-naive. Compare against naive form.
+    newer_ts_naive = newer_ts.tz_convert("UTC").tz_localize(None)
+    older_ts_naive = older_ts.tz_convert("UTC").tz_localize(None)
+    assert selected["collected_at"] == newer_ts_naive
 
     log = long.attrs["_priority_dedup_log"]
     dropped = log[(log["area"] == "mainland") & (log["role"] == "dropped")]
     assert len(dropped) == 1
     assert dropped.iloc[0]["smp_krw_per_kwh"] == 100.0
     assert dropped.iloc[0]["source_file_sha256"] == "a" * 64
-    assert dropped.iloc[0]["collected_at"] == older_ts
+    assert dropped.iloc[0]["collected_at"] == older_ts_naive
     assert dropped.iloc[0]["reason"] == "older_revision"
+
+
+def test_collected_at_output_is_tz_naive(tmp_path, monkeypatch):
+    """External contract: load_smp_monthly_long() and its _priority_dedup_log
+    must expose ``collected_at`` as UTC-naive ``datetime64`` regardless of
+    whether on-disk parquets stored it tz-naive (legacy) or tz-aware (new).
+
+    Regression for the Codex adversarial-review finding that the prior fix
+    leaked tz-aware UTC timestamps into the public surface, silently changing
+    the side-info JSON schema and breaking downstream consumers that compared
+    against the documented UTC-naive collectors output.
+    """
+    from src.utils import io as io_mod
+    import importlib
+
+    class _Stub:
+        data_dir = tmp_path / "data"
+    monkeypatch.setattr(io_mod, "get_settings", lambda: _Stub())
+    bm = importlib.reload(importlib.import_module("src.features.build_monthly"))
+
+    # Mix tz-naive (legacy collector output) and tz-aware (hypothetical new
+    # collector) on the SAME source so the dedup path normalises both.
+    naive_legacy = pd.DataFrame({
+        "period_month": [pd.Timestamp("2025-01-01")],
+        "area": ["mainland"],
+        "smp_krw_per_kwh": [100.0],
+        "source_id": "kpx_smp_monthly_kepco_file",
+        "collected_at": pd.Timestamp("2026-04-01T12:00:00"),  # tz-NAIVE
+        "source_file": "legacy.csv",
+        "source_file_sha256": "a" * 64,
+        "source_priority": 1,
+    })
+    tzaware_new = naive_legacy.copy()
+    tzaware_new["smp_krw_per_kwh"] = [123.45]
+    tzaware_new["collected_at"] = pd.Timestamp("2026-05-01T09:30:00Z")  # tz-AWARE
+    tzaware_new["source_file"] = "new.csv"
+    tzaware_new["source_file_sha256"] = "b" * 64
+
+    root = bm.source_root_dir("kpx_smp_monthly_kepco_file")
+    d_old = root / "2025" / "01" / "01"
+    d_new = root / "2025" / "01" / "02"
+    d_old.mkdir(parents=True, exist_ok=True)
+    d_new.mkdir(parents=True, exist_ok=True)
+    naive_legacy.to_parquet(d_old / "parsed_legacy.parquet", index=False)
+    tzaware_new.to_parquet(d_new / "parsed_new.parquet", index=False)
+
+    long = bm.load_smp_monthly_long()
+
+    # Returned dataframe contract: collected_at is UTC-NAIVE.
+    assert long["collected_at"].dt.tz is None, (
+        f"load_smp_monthly_long() must return tz-naive collected_at, "
+        f"got tz={long['collected_at'].dt.tz!r}"
+    )
+
+    # Dedup log contract: collected_at is UTC-NAIVE.
+    log = long.attrs["_priority_dedup_log"]
+    assert not log.empty, "Both rows conflict, so dedup log must contain them"
+    assert log["collected_at"].dt.tz is None, (
+        f"_priority_dedup_log must expose tz-naive collected_at, "
+        f"got tz={log['collected_at'].dt.tz!r}"
+    )
+
+    # Ranking still uses full UTC precision internally → newer (2026-05-01)
+    # supersedes older (2026-04-01) regardless of input tz-awareness.
+    selected = long[
+        (long["period_month"] == pd.Timestamp("2025-01-01"))
+        & (long["area"] == "mainland")
+    ].iloc[0]
+    assert selected["smp_krw_per_kwh"] == 123.45
+    assert selected["collected_at"] == pd.Timestamp("2026-05-01T09:30:00"), (
+        "Newer UTC timestamp (originally tz-aware) must win and be returned "
+        "in tz-naive form."
+    )

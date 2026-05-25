@@ -121,7 +121,22 @@ class BaseFileLoader(abc.ABC):
             target_dir = raw_response_dir(self.source_name, event_date)
             target_dir.mkdir(parents=True, exist_ok=True)
 
-            raw_copy_path = target_dir / f"raw_{_stamp(collected_at)}{file_path.suffix.lower()}"
+            # Per-file disambiguator: microseconds within the second + first 8
+            # hex of source_file_sha256. Prevents same-second loads in
+            # load_all() from overwriting each other's snapshots (Codex
+            # adversarial-review finding #1: high-severity no-overwrite).
+            sha_part = (run.file_sha256 or "nosha")[:8]
+            us_part = f"{collected_at.microsecond:06d}"
+            name_suffix = f"{us_part}_{sha_part}"
+
+            raw_copy_path = (
+                target_dir
+                / f"raw_{_stamp(collected_at)}__{name_suffix}{file_path.suffix.lower()}"
+            )
+            if raw_copy_path.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite existing raw snapshot: {raw_copy_path}"
+                )
             shutil.copy2(file_path, raw_copy_path)
 
             # Stamp every parsed row with the revision-metadata the downstream
@@ -129,15 +144,21 @@ class BaseFileLoader(abc.ABC):
             # when the same (period_month, area) is loaded more than once.
             # Compute the future parsed_path BEFORE writing so it matches the
             # path that write_parsed_dataframe will produce (same `collected_at`
-            # → same `_stamp`).
-            future_parsed_path = target_dir / f"parsed_{_stamp(collected_at)}.parquet"
+            # + same `name_suffix` → same path).
+            future_parsed_path = (
+                target_dir / f"parsed_{_stamp(collected_at)}__{name_suffix}.parquet"
+            )
             df = df.copy()
             df["source_file_sha256"] = run.file_sha256
             df["source_priority"] = self.config.get("source_priority")
             df["parsed_path"] = str(future_parsed_path)
 
             parsed_path = write_parsed_dataframe(
-                self.source_name, df, event_date=event_date, collected_at=collected_at
+                self.source_name,
+                df,
+                event_date=event_date,
+                collected_at=collected_at,
+                name_suffix=name_suffix,
             )
             metadata = {
                 **run.to_metadata(),
@@ -164,7 +185,11 @@ class BaseFileLoader(abc.ABC):
                 "zero_coerced_rows": df.attrs.get("_zero_coerced_rows", {}),
             }
             meta_path = write_metadata(
-                self.source_name, metadata, event_date=event_date, collected_at=collected_at
+                self.source_name,
+                metadata,
+                event_date=event_date,
+                collected_at=collected_at,
+                name_suffix=name_suffix,
             )
             run.paths = RawSavePaths(
                 raw_response=raw_copy_path, parsed_dataframe=parsed_path, metadata=meta_path

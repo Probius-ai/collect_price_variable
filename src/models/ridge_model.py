@@ -26,6 +26,12 @@ DEFAULT_RIDGE_FEATURES_HOURLY = [
 ]
 
 DEFAULT_RIDGE_FEATURES_MONTHLY = [
+    # `smp_t_observed` = SMP at row M (the issue date). Observed before we
+    # forecast M+1 — not leakage. This is the dominant predictive signal
+    # and was previously withheld from features, which forced "naive"
+    # models to lean on smp_lag_1m (= SMP at M-1) and effectively become
+    # 2-step-lag baselines instead of true persistence baselines.
+    "smp_t_observed",
     "smp_lag_1m",
     "smp_lag_2m",
     "smp_lag_3m",
@@ -38,6 +44,8 @@ DEFAULT_RIDGE_FEATURES_MONTHLY = [
     "month_sin",
     "month_cos",
     "quarter",
+    # NB: removed `is_lng_shock_period` (post-hoc / look-ahead leakage —
+    # boundaries were defined retrospectively from the valid peak threshold).
     # Settlement (wide-by-fuel, lag_1m) — added when settlement monthly is loaded.
     "settlement_unit_price_total_lag_1m",
     "settlement_unit_price_nuclear_lag_1m",
@@ -65,10 +73,31 @@ class RidgeModel:
             if missing:
                 raise KeyError(f"Ridge: missing requested features {missing}")
             return list(self.feature_cols)
-        # Auto-detect granularity: prefer monthly defaults when monthly lags exist.
-        if any(c.endswith("_lag_1m") or c.endswith("_lag_12m") for c in X.columns):
-            return [c for c in DEFAULT_RIDGE_FEATURES_MONTHLY if c in X.columns]
-        return [c for c in DEFAULT_RIDGE_FEATURES_HOURLY if c in X.columns]
+        # Auto-detect granularity. We mark a frame as "monthly" when ANY of
+        # these holds: it carries a monthly lag (_lag_1m / _lag_12m / _lag_1y)
+        # OR the explicit smp_t_observed observed-at-origin column. The
+        # smp_t_observed branch was added in round 5 because feature-group
+        # ablation handed Ridge subsets containing smp_t_observed alone (no
+        # lag columns) and the old heuristic silently picked the hourly pool
+        # — yielding an empty intersection and a StandardScaler error.
+        is_monthly = (
+            "smp_t_observed" in X.columns
+            or any(
+                c.endswith("_lag_1m") or c.endswith("_lag_12m") or c.endswith("_lag_1y")
+                for c in X.columns
+            )
+        )
+        default_pool = (
+            DEFAULT_RIDGE_FEATURES_MONTHLY if is_monthly else DEFAULT_RIDGE_FEATURES_HOURLY
+        )
+        chosen = [c for c in default_pool if c in X.columns]
+        if chosen:
+            return chosen
+        # Last-resort fallback: if the default pool didn't intersect with X
+        # (e.g. ablation handed us a feature group composed entirely of
+        # capacity_* columns Ridge's default doesn't list), use every numeric
+        # column in X. Better than silently raising 0-feature errors.
+        return list(X.columns)
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> "RidgeModel":
         self.used_features = self._select_features(X)

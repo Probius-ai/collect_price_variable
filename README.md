@@ -131,6 +131,112 @@ python -m src.pipelines.train --features-path data/processed/smp_hourly_mainland
 python -m src.pipelines.evaluate
 ```
 
+## Forecast contract + persistence baseline
+
+The monthly model emits **1-month-ahead forecasts** under this contract:
+
+* **forecast_origin_month** = the month *after* which the forecast is made
+  (i.e. all information up to and including this month is observable).
+* **information_cutoff** = `end-of-day(last day of forecast_origin_month)`.
+* **target_month** = `forecast_origin_month + 1 month`.
+* **horizon** = `"1M"`.
+
+Every row in `data/processed/smp_monthly_<area>_h1m.parquet` and every row
+in `outputs/models/<m>/predictions_<split>.csv` now carries these four
+columns. Under this contract, `smp_t_observed` (SMP at the forecast
+origin month) is fully observable before the target month and is **not
+leakage**.
+
+### Persistence is the strong baseline
+
+`persistence_monthly` predicts `SMP(M+1) = SMP(M)` — i.e. it always
+returns the last observed value. On the dashboard, its prediction line
+**naturally follows the actual series with a one-month delay**; that is
+the floor every trainable model must beat. We separate baselines from
+trainable models in `src/models/registry.py` and the dashboard
+Predictions page defaults to the strongest trainable model
+(`monthly_ar_ridge`), overlaying persistence as a reference line.
+
+### Limits of monthly-only data
+
+**Reducing the visible one-month lag is not possible with the current
+monthly file-based pipeline alone.** Three things would change that:
+
+1. **Leading exogenous variables** — e.g. next-month natural-gas-price
+   futures, planned nuclear outage schedules, ANRE quota changes. These
+   are signals about month M+1 that are known at the M cutoff.
+2. **Hourly / day-ahead API data** — the KPX SMP day-ahead API (pending
+   approval) provides intra-month variability whose intra-month dynamics
+   the monthly aggregate erases.
+3. **Multi-horizon forecasts** — direct-multi-step or recursive
+   forecasting can give 2- and 3-month-ahead estimates whose error has a
+   different decomposition than the 1-step task.
+
+The current code is conservative on these fronts: it documents the
+persistence floor, and reports both level metrics and delta-vs-baseline
+diagnostics so honest improvement is measurable.
+
+## Baseline snapshots (before/after comparison)
+
+`src/pipelines/save_baseline_plots.py` freezes the current model results
+into a tagged folder under `outputs/figures/<tag>/`. The intended flow:
+
+1. Take a snapshot of today's pipeline (no LNG-price forecasting yet):
+
+   ```bash
+   python -m src.pipelines.save_baseline_plots
+   # → outputs/figures/baseline_pre_lng_forecast_<YYYYMMDD>/
+   ```
+
+2. Later, after integrating LNG-price forecasts (or any other
+   leading-indicator feature), take a second snapshot under a different
+   tag:
+
+   ```bash
+   python -m src.pipelines.save_baseline_plots --tag baseline_post_lng_v1
+   ```
+
+   Pass `--docs-copy` if a committed markdown report (e.g. the project
+   report in `docs/project_report_kr.md`) references these images — that
+   mirrors the PNGs into `docs/figures/<tag>/` so the report survives a
+   fresh clone (the original `outputs/figures/**` path is gitignored):
+
+   ```bash
+   python -m src.pipelines.save_baseline_plots \
+       --tag baseline_post_lng_v1 --docs-copy
+   ```
+
+3. Diff the two folders to show the lag-reduction visually.
+
+Each snapshot contains 6 PNG plots (predictions overlay, persistence-lag
+zoom, residuals, MAE/R² bar chart, walk-forward over 150 months,
+feature-group ablation heatmap), per-model raw predictions CSV, and a
+`summary.md` recording the metric values + the forecast contract in
+effect.
+
+## Dashboard (read-only viewer)
+
+A Streamlit dashboard at [`dashboard.py`](dashboard.py) reads the artefacts
+produced by the CLI pipelines (parsed parquets, processed feature tables,
+`outputs/metrics/comparison.csv`, model predictions, side-info JSONs, DQ
+reports) and presents them through 5 pages: Overview, Models, Predictions,
+Features, Data Quality. It never writes to the data tree.
+
+```bash
+pip install -r requirements.txt        # includes streamlit + plotly
+streamlit run dashboard.py             # opens http://localhost:8501
+```
+
+What each page shows:
+
+| Page | Source files |
+| --- | --- |
+| 1. Overview | `data/raw/kpx/*/parsed_*.parquet` inventory + drop-inbox state |
+| 2. Models | `outputs/metrics/comparison.csv` (MAE/RMSE/MAPE × split) |
+| 3. Predictions | `outputs/models/<model>/predictions_<split>.csv` overlay |
+| 4. Features | `data/processed/smp_monthly_<area>_h1m.parquet` + sideinfo, grouped by feature family (baseline / settlement / capacity / transaction) |
+| 5. Data Quality | latest `outputs/data_quality/report_*.json` + per-area `_priority_dedup_log` |
+
 ## Repository layout
 
 ```

@@ -89,6 +89,72 @@ REC_WEEKLY_COLUMNS = [
     "source_file",
 ]
 
+# Round-3 additions: capacity / transaction long-format schemas. Each loader
+# emits exactly these columns so the feature builder doesn't need to know the
+# underlying vendor file shape.
+
+CAPACITY_YEARLY_COLUMNS = [
+    "source_id",
+    "period_year",
+    "row_category",
+    "capacity_category_level1",
+    "capacity_category_level2",
+    "capacity_mw",
+    "collected_at",
+    "source_file",
+]
+
+CAPACITY_MONTHLY_BY_GENERATION_TYPE_COLUMNS = [
+    "source_id",
+    "period_month",
+    "member_type",
+    "dispatch_type",
+    "business_type",
+    "region",
+    "capacity_type_level1",
+    "capacity_type_level2",
+    "capacity_type_canonical",
+    "capacity_mw",
+    "collected_at",
+    "source_file",
+]
+
+CAPACITY_MONTHLY_BY_FUEL_COLUMNS = [
+    "source_id",
+    "period_month",
+    "member_type",
+    "dispatch_type",
+    "business_type",
+    "region",
+    "fuel_type_raw",
+    "fuel_type",
+    "capacity_mw",
+    "collected_at",
+    "source_file",
+]
+
+TRANSACTION_VOLUME_HOURLY_COLUMNS = [
+    "source_id",
+    "trade_date",
+    "trade_hour",
+    "interval_end",
+    "fuel_type_raw",
+    "fuel_type",
+    "transaction_volume_mwh",
+    "collected_at",
+    "source_file",
+]
+
+TRANSACTION_AMOUNT_DAILY_COLUMNS = [
+    "source_id",
+    "trade_date",
+    "fuel_type_raw",
+    "fuel_type",
+    "transaction_amount_krw",
+    "collected_at",
+    "source_file",
+]
+
 
 # ---------------------------------------------------------------------------
 # Generic tabular reader (CSV + XLSX, single + multi-row headers)
@@ -521,6 +587,276 @@ class KpxSmpYearlyLoader(BaseFileLoader):
         return set()
 
 
+# ===========================================================================
+# Round-3 loaders: capacity (yearly + monthly) and transaction (hourly + daily)
+# ===========================================================================
+
+import re
+
+
+def _filter_meta_total_rows(
+    df: pd.DataFrame, default_filters: dict[str, str] | None
+) -> pd.DataFrame:
+    """Keep only rows where each metadata column equals its 'total' label.
+
+    Used by both monthly capacity loaders — MVP only keeps the all-total
+    breakdown (e.g. member_type='합계', region='합계' …). Drops nothing if
+    `default_filters` is None or empty.
+    """
+    if not default_filters:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for col, expected in default_filters.items():
+        if col not in df.columns:
+            continue
+        mask &= df[col].astype(str).str.strip() == str(expected).strip()
+    return df.loc[mask].reset_index(drop=True)
+
+
+def _melt_capacity_wide(
+    df: pd.DataFrame,
+    *,
+    id_vars: list[str],
+    sep: str = "|",
+) -> pd.DataFrame:
+    """Melt every non-id column into level1/level2/value rows.
+
+    Robust to empty input: if the post-filter dataframe has no rows, returns an
+    empty long-format frame with the canonical schema so downstream code can
+    proceed (and a separate emptiness check can surface the missing data).
+    """
+    value_cols = [c for c in df.columns if c not in id_vars]
+    long = df.melt(
+        id_vars=id_vars,
+        value_vars=value_cols,
+        var_name="capacity_category_raw",
+        value_name="capacity_mw",
+    )
+    if long.empty:
+        long["capacity_category_level1"] = pd.Series(dtype="object")
+        long["capacity_category_level2"] = pd.Series(dtype="object")
+        long["capacity_mw"] = pd.Series(dtype="float64")
+        return long.drop(columns=["capacity_category_raw"])
+    split = long["capacity_category_raw"].astype(str).str.split(sep, n=1, expand=True)
+    long["capacity_category_level1"] = split[0].fillna("").str.strip()
+    long["capacity_category_level2"] = (
+        split[1].fillna("").str.strip() if split.shape[1] > 1 else ""
+    )
+    long = long.drop(columns=["capacity_category_raw"])
+    long["capacity_mw"] = pd.to_numeric(
+        long["capacity_mw"].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    return long
+
+
+class KpxCapacityYearlyByEnergySourceHomeFileLoader(BaseFileLoader):
+    """HOME 발전설비 연도별 에너지원별 (multi-row header, year from filename).
+
+    Vendor: rows = 구분 (a row-category fuel name); columns = level1|level2
+    breakdown such as 기력|유연탄, 복합화력|LNG, 신재생, 총계. The year is encoded
+    in the filename via the pattern ``(YYYY)`` and never inside the file body.
+    """
+
+    source_name = "kpx_capacity_yearly_by_energy_source_home_file"
+
+    def required_columns(self) -> set[str]:
+        return set(CAPACITY_YEARLY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        # Extract the year from the filename. Refuse to load files that don't
+        # carry a year — we have no other source for it.
+        pattern = self.config.get("period_from_filename_regex") or r"\((\d{4})\)"
+        match = re.search(pattern, file_path.name)
+        if not match:
+            raise FileLoaderError(
+                f"{file_path.name} does not match period_from_filename_regex="
+                f"{pattern!r}; cannot infer period_year."
+            )
+        period_year = int(match.group(1))
+
+        df = _read_tabular(file_path, self.config)
+        # The first flattened column is "구분|" (level1 only). Promote it to
+        # row_category and strip the trailing '|' artifact.
+        first_col = df.columns[0]
+        df = df.rename(columns={first_col: "row_category"})
+        df["row_category"] = df["row_category"].astype(str).str.strip()
+        # Drop rows where row_category is blank / pure whitespace / NaN.
+        df = df[df["row_category"].ne("") & df["row_category"].ne("nan")].copy()
+
+        long = _melt_capacity_wide(df, id_vars=["row_category"])
+        long["period_year"] = period_year
+        long["source_id"] = self.source_name
+        long["collected_at"] = _now_str()
+        long["source_file"] = file_path.name
+        # Drop NaN capacity (vendor leaves blanks for non-applicable cells).
+        long = long.dropna(subset=["capacity_mw"]).reset_index(drop=True)
+        return long[CAPACITY_YEARLY_COLUMNS]
+
+
+class KpxCapacityMonthlyByGenerationTypeHomeFileLoader(BaseFileLoader):
+    """HOME 발전설비 발전형식별 (월별). Multi-row header; (member,dispatch,
+    business,region)=합계 rows only."""
+
+    source_name = "kpx_capacity_monthly_by_generation_type_home_file"
+
+    def required_columns(self) -> set[str]:
+        return set(CAPACITY_MONTHLY_BY_GENERATION_TYPE_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        # Flattened columns from row0/row1 are like "기간|", "회원구분|", "원자력|",
+        # "기력|유연탄", … Strip the trailing '|' on level0-only entries so the
+        # mapping below matches plain "기간" etc.
+        df.columns = [str(c).rstrip("|").strip() for c in df.columns]
+        # Rename canonical metadata columns.
+        meta_map = self.config["column_mapping"]
+        df = _rename_with_mapping(df, meta_map)
+        # Filter to total-only rows for MVP.
+        df = _filter_meta_total_rows(df, self.config.get("default_filters"))
+        df["period_month"] = _parse_period(
+            df["period"], self.config.get("period_format")
+        )
+
+        id_vars = [
+            "period_month", "member_type", "dispatch_type",
+            "business_type", "region",
+        ]
+        # Drop 'period' because period_month replaces it.
+        value_df = df.drop(columns=["period"])
+        long = _melt_capacity_wide(value_df, id_vars=id_vars)
+        gen_map = self.config.get("generation_type_mapping", {}) or {}
+        long["capacity_type_level1"] = long["capacity_category_level1"]
+        long["capacity_type_level2"] = long["capacity_category_level2"]
+        joined_key = (
+            long["capacity_type_level1"]
+            + long["capacity_type_level2"].map(lambda s: f"|{s}" if s else "")
+        )
+        long["capacity_type_canonical"] = joined_key.map(gen_map).fillna(
+            long["capacity_type_level1"].map(gen_map)
+        )
+        long = long.drop(columns=["capacity_category_level1", "capacity_category_level2"])
+        long = long.dropna(subset=["capacity_mw"]).reset_index(drop=True)
+        long["source_id"] = self.source_name
+        long["collected_at"] = _now_str()
+        long["source_file"] = file_path.name
+        return long[CAPACITY_MONTHLY_BY_GENERATION_TYPE_COLUMNS]
+
+
+class KpxCapacityMonthlyByFuelHomeFileLoader(BaseFileLoader):
+    """HOME 발전설비 연료원별 (월별). Multi-row header with 신재생 sub-fuels."""
+
+    source_name = "kpx_capacity_monthly_by_fuel_home_file"
+
+    def required_columns(self) -> set[str]:
+        return set(CAPACITY_MONTHLY_BY_FUEL_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df.columns = [str(c).rstrip("|").strip() for c in df.columns]
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        df = _filter_meta_total_rows(df, self.config.get("default_filters"))
+        df["period_month"] = _parse_period(
+            df["period"], self.config.get("period_format")
+        )
+
+        id_vars = [
+            "period_month", "member_type", "dispatch_type",
+            "business_type", "region",
+        ]
+        value_df = df.drop(columns=["period"])
+        long = _melt_capacity_wide(value_df, id_vars=id_vars)
+        long["fuel_type_raw"] = (
+            long["capacity_category_level1"]
+            + long["capacity_category_level2"].map(lambda s: f"|{s}" if s else "")
+        )
+        fuel_map = self.config.get("fuel_type_mapping", {}) or {}
+        long["fuel_type"] = long["fuel_type_raw"].map(fuel_map)
+        long = long.drop(columns=["capacity_category_level1", "capacity_category_level2"])
+        # Keep only rows whose raw key maps to a canonical fuel — unmapped
+        # vendor columns (e.g. trailing empty headers) get dropped.
+        long = long.dropna(subset=["fuel_type", "capacity_mw"]).reset_index(drop=True)
+        long["source_id"] = self.source_name
+        long["collected_at"] = _now_str()
+        long["source_file"] = file_path.name
+        return long[CAPACITY_MONTHLY_BY_FUEL_COLUMNS]
+
+
+class KpxTransactionVolumeHourlyByFuelFileLoader(BaseFileLoader):
+    """KPX 연료원별 시간대별 전력거래량 (file path, single-header).
+
+    trade_hour 1..24 → interval_end. trade_hour=24 wraps to (date+1, 00:00),
+    matching the SMP hourly convention.
+    """
+
+    source_name = "kpx_transaction_volume_hourly_by_fuel_file"
+
+    def required_columns(self) -> set[str]:
+        return set(TRANSACTION_VOLUME_HOURLY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        fmt = self.config.get("trade_date_format")
+        df["trade_date"] = pd.to_datetime(
+            df["trade_date"].astype(str),
+            format=fmt if fmt and fmt != TBD else None,
+            errors="coerce",
+        ).dt.normalize()
+        df = _coerce_numeric(df, ["trade_hour", "transaction_volume_mwh"])
+        df = df.dropna(subset=["trade_date", "trade_hour"]).copy()
+        df["trade_hour"] = df["trade_hour"].astype(int)
+        if not df["trade_hour"].between(1, 24).all():
+            bad = df.loc[~df["trade_hour"].between(1, 24), "trade_hour"].unique()
+            raise FileLoaderError(
+                f"trade_hour out of expected 1..24 range: {sorted(bad.tolist())}"
+            )
+        df["interval_end"] = df["trade_date"] + pd.to_timedelta(
+            df["trade_hour"], unit="h"
+        )
+        fuel_map = self.config.get("fuel_type_mapping", {}) or {}
+        df["fuel_type_raw"] = df["fuel_name"].astype(str).str.strip()
+        df["fuel_type"] = df["fuel_type_raw"].map(fuel_map)
+        df = df.dropna(subset=["fuel_type"]).reset_index(drop=True)
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return df[TRANSACTION_VOLUME_HOURLY_COLUMNS]
+
+
+class KpxTransactionAmountDailyByFuelFileLoader(BaseFileLoader):
+    """KPX 연료원별 일별 전력거래금액. Vendor column '전력거래금액(원)' → KRW.
+
+    Note: data.go.kr description page sometimes mislabels the unit as MWh,
+    but the file header is authoritative.
+    """
+
+    source_name = "kpx_transaction_amount_daily_by_fuel_file"
+
+    def required_columns(self) -> set[str]:
+        return set(TRANSACTION_AMOUNT_DAILY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        fmt = self.config.get("trade_date_format")
+        df["trade_date"] = pd.to_datetime(
+            df["trade_date"].astype(str),
+            format=fmt if fmt and fmt != TBD else None,
+            errors="coerce",
+        ).dt.normalize()
+        df = _coerce_numeric(df, ["transaction_amount_krw"])
+        df = df.dropna(subset=["trade_date"]).copy()
+        fuel_map = self.config.get("fuel_type_mapping", {}) or {}
+        df["fuel_type_raw"] = df["fuel_name"].astype(str).str.strip()
+        df["fuel_type"] = df["fuel_type_raw"].map(fuel_map)
+        df = df.dropna(subset=["fuel_type"]).reset_index(drop=True)
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return df[TRANSACTION_AMOUNT_DAILY_COLUMNS]
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -531,4 +867,14 @@ LOADERS: dict[str, type[BaseFileLoader]] = {
     KpxSettlementMonthlyFileLoader.source_name: KpxSettlementMonthlyFileLoader,
     KpxRecWeeklyFileLoader.source_name: KpxRecWeeklyFileLoader,
     KpxSmpYearlyLoader.source_name: KpxSmpYearlyLoader,
+    KpxCapacityYearlyByEnergySourceHomeFileLoader.source_name:
+        KpxCapacityYearlyByEnergySourceHomeFileLoader,
+    KpxCapacityMonthlyByGenerationTypeHomeFileLoader.source_name:
+        KpxCapacityMonthlyByGenerationTypeHomeFileLoader,
+    KpxCapacityMonthlyByFuelHomeFileLoader.source_name:
+        KpxCapacityMonthlyByFuelHomeFileLoader,
+    KpxTransactionVolumeHourlyByFuelFileLoader.source_name:
+        KpxTransactionVolumeHourlyByFuelFileLoader,
+    KpxTransactionAmountDailyByFuelFileLoader.source_name:
+        KpxTransactionAmountDailyByFuelFileLoader,
 }

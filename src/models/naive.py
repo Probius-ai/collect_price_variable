@@ -42,11 +42,34 @@ class SeasonalNaiveLag168h(NaiveLag24h):
 
 
 class NaiveLag1m(NaiveLag24h):
-    """Monthly naive baseline: predicts target as previous-month SMP."""
+    """Monthly baseline driven by ``smp_lag_1m``.
+
+    Important: with target = SMP at M+1 and feature smp_lag_1m = SMP at M-1,
+    this model fits ``SMP(M+1) ≈ SMP(M-1)`` — a **2-step seasonal lag**, NOT
+    a true persistence baseline. The visual symptom on the dashboard is that
+    the predicted line looks like the actual SMP shifted forward by 2
+    months. Use ``PersistenceMonthly`` below for the true "next month equals
+    current month" baseline.
+    """
 
     name = "naive_lag_1m"
 
     def __init__(self, lag_column: str = "smp_lag_1m") -> None:
+        super().__init__(lag_column=lag_column)
+
+
+class PersistenceMonthly(NaiveLag24h):
+    """True persistence baseline: predicts target_(M+1) as SMP at M.
+
+    Uses ``smp_t_observed`` — the current-month SMP — which is observed
+    before we forecast M+1 (no leakage). This is the correct "last known
+    value" baseline and is what most forecasting literature means by
+    "naive" for a 1-step-ahead monthly forecast.
+    """
+
+    name = "persistence_monthly"
+
+    def __init__(self, lag_column: str = "smp_t_observed") -> None:
         super().__init__(lag_column=lag_column)
 
 

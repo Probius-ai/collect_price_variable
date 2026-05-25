@@ -83,17 +83,39 @@ def write_raw_payload(
     return path
 
 
+def _snapshot_basename(prefix: str, stamp: str, name_suffix: str | None, ext: str) -> str:
+    """Build a snapshot filename, optionally inserting a per-file disambiguator.
+
+    Without a suffix: ``prefix_<stamp>.<ext>`` (legacy).
+    With a suffix:    ``prefix_<stamp>__<suffix>.<ext>`` (Codex no-overwrite
+    finding: same-second loads in load_all() must produce distinct outputs).
+    """
+    if name_suffix:
+        return f"{prefix}_{stamp}__{name_suffix}.{ext}"
+    return f"{prefix}_{stamp}.{ext}"
+
+
 def write_parsed_dataframe(
     source: str,
     df: pd.DataFrame,
     *,
     event_date: date | None = None,
     collected_at: datetime | None = None,
+    name_suffix: str | None = None,
 ) -> Path:
     directory = raw_response_dir(source, event_date)
     directory.mkdir(parents=True, exist_ok=True)
     stamp = _stamp(collected_at)
-    path = directory / f"parsed_{stamp}.parquet"
+    path = directory / _snapshot_basename("parsed", stamp, name_suffix, "parquet")
+    if path.exists():
+        # Snapshot files are immutable artefacts (the on-disk audit trail);
+        # an existing path means two loads in the same second on the same
+        # event date with the same disambiguator — surface it rather than
+        # silently overwriting.
+        raise FileExistsError(
+            f"Refusing to overwrite existing parsed snapshot: {path}. "
+            "Pass a more specific name_suffix (e.g. include source_file_sha256)."
+        )
     df.to_parquet(path, index=False)
     logger.info("Wrote parsed dataframe: %s (rows=%d)", path, len(df))
     return path
@@ -105,11 +127,17 @@ def write_metadata(
     *,
     event_date: date | None = None,
     collected_at: datetime | None = None,
+    name_suffix: str | None = None,
 ) -> Path:
     directory = raw_response_dir(source, event_date)
     directory.mkdir(parents=True, exist_ok=True)
     stamp = _stamp(collected_at)
-    path = directory / f"metadata_{stamp}.json"
+    path = directory / _snapshot_basename("metadata", stamp, name_suffix, "json")
+    if path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite existing metadata snapshot: {path}. "
+            "Pass a more specific name_suffix (e.g. include source_file_sha256)."
+        )
     path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     logger.info("Wrote metadata: %s", path)
     return path
