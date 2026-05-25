@@ -2,6 +2,16 @@
 .env.*
 !.env.example
 
+# External sister projects dropped into this repo for integration reference.
+# They carry their own .env (with API keys + DB credentials), their own .venv
+# (~600 MB), and large input CSVs (~90 MB). They are NOT part of this repo's
+# build/test surface — they are looked at by hand and documented in
+# docs/external_models_inventory.md.
+solar/
+solar_beam/
+additional_data/
+additional_data_2/
+
 __pycache__/
 *.py[cod]
 *$py.class
@@ -46,6 +56,9 @@ data/raw/**/*.json
 data/raw/**/*.xml
 data/raw/**/*.csv
 data/raw/**/*.parquet
+data/raw/**/*.xlsx
+data/raw/**/*.xls
+data/raw/**/*.zip
 data/interim/**/*
 data/processed/**/*
 data/snapshots/**/*
