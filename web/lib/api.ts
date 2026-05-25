@@ -54,6 +54,38 @@ export interface SolarIntegrationStatus {
   kind: string;
 }
 
+export interface ForecastResponse {
+  model_name: string;
+  version: string;
+  unit: string;
+  forecast_origin_month: string;
+  target_month: string;
+  predicted_smp_krw_per_kwh: number;
+  most_recent_actual_smp_krw_per_kwh: number | null;
+  most_recent_actual_month: string | null;
+  inference_seconds: number;
+  artifact: Record<string, string>;
+  note: string;
+}
+
+export interface HourlyForecastPoint {
+  hour: number;
+  solar_capacity_factor: number;
+  smp_multiplier: number;
+  predicted_smp_krw_per_kwh: number;
+  band: string;
+}
+
+export interface HourlyForecastResponse {
+  base_monthly_mae_krw_per_kwh: number;
+  daily_mean_krw_per_kwh: number;
+  target_month: string;
+  unit: string;
+  points: HourlyForecastPoint[];
+  methodology: string;
+  caveat: string;
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
@@ -75,6 +107,9 @@ export const api = {
     fetchJson<RetrainStatus>("/api/retrain", { method: "POST" }),
   solarIntegration: () =>
     fetchJson<SolarIntegrationStatus[]>("/api/solar/integration"),
+  forecastNext: () => fetchJson<ForecastResponse>("/api/forecast/next"),
+  forecastHourly: () =>
+    fetchJson<HourlyForecastResponse>("/api/forecast/hourly"),
 };
 
 export { API_BASE };

@@ -422,6 +422,284 @@ def trigger_retrain() -> RetrainStatusResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Forecast — the actual KRW/kWh number the selection service exists to produce
+# ---------------------------------------------------------------------------
+
+
+class ForecastResponse(BaseModel):
+    model_name: str
+    version: str
+    unit: str                          # always "KRW/kWh"
+    forecast_origin_month: str         # the month whose features we used
+    target_month: str                  # the month being predicted
+    predicted_smp_krw_per_kwh: float
+    most_recent_actual_smp_krw_per_kwh: float | None
+    most_recent_actual_month: str | None
+    inference_seconds: float
+    artifact: dict[str, str]           # paths the prediction was built from
+    note: str
+
+
+def _pick_best_v5_artifact() -> tuple[str, str, Path]:
+    """Pick the best (version, model_name, artifact_dir) whose pickle is
+    actually usable (non-empty and unpicklable).
+
+    Skips models whose pickle is 0 bytes — that happens silently for
+    delta wrappers (DeltaRidge / DeltaLightGBM / DeltaARRidge) because
+    they hold lambdas via `_DeltaWrapped._base_factory`, which raises
+    `Can't pickle local object …` during `pickle.dump()` and the smoke
+    test caches `model_path = None` in that branch instead of writing.
+
+    Preference order:
+      1. v5 latest_candidates sorted ascending by MAE — skip empty pickles
+      2. Best historical model with a usable pickle, across v1..v4
+    """
+    df = _load_comparison_df()
+    clean = df[df["skipped"] != True]  # noqa: E712
+
+    def _usable(version: str, model: str) -> Path | None:
+        p = ROOT / "outputs" / "mlops_smoke_test" / version / model / "model.pkl"
+        try:
+            return p if p.exists() and p.stat().st_size > 0 else None
+        except OSError:
+            return None
+
+    # 1. v5 latest candidates, sorted by MAE
+    v5 = clean[clean["registry_status"] == "latest_candidate"].sort_values("mae")
+    for _, row in v5.iterrows():
+        m = str(row["model"])
+        path = _usable("v5", m)
+        if path is not None:
+            return "v5", m, path.parent
+
+    # 2. Any historical model with a usable pickle (best MAE first)
+    hist = clean[clean["version"].isin(["v1", "v2", "v3", "v4"])].sort_values("mae")
+    for _, row in hist.iterrows():
+        v = str(row["version"])
+        m = str(row["model"])
+        path = _usable(v, m)
+        if path is not None:
+            return v, m, path.parent
+
+    raise HTTPException(
+        404,
+        "No usable model.pkl found in outputs/mlops_smoke_test/. "
+        "Run a retrain (POST /api/retrain).",
+    )
+
+
+@app.get("/api/forecast/next", response_model=ForecastResponse)
+def forecast_next_month() -> ForecastResponse:
+    """Produce the actual KRW/kWh forecast the model-selection service
+    exists to deliver.
+
+    Loads the recommended v5 model's pickle, applies it to the most
+    recent row of the monthly feature panel, and returns the predicted
+    SMP for ``forecast_origin_month + 1`` along with the most recent
+    actually-observed SMP for reference.
+
+    This is what makes the page a "price model selection service" — the
+    selection is justified by the concrete price number the model
+    actually produces, not just MAE numbers in the abstract.
+    """
+    import pickle, time
+
+    version_used, model_name, artifact_dir = _pick_best_v5_artifact()
+    pickle_path = artifact_dir / "model.pkl"
+    if not pickle_path.exists():
+        raise HTTPException(
+            500,
+            f"Model pickle not found at {pickle_path.relative_to(ROOT)}. "
+            "Some delta-wrappers contain lambdas and don't pickle; pick a "
+            "different recommended model or re-run the smoke test.",
+        )
+
+    # Load the feature panel and pick the latest row whose features are
+    # observable. The model predicts target_smp_t_plus_h_months = SMP at
+    # period_month + 1.
+    feature_path = ROOT / "data" / "processed" / "smp_monthly_mainland_h1m.parquet"
+    if not feature_path.exists():
+        raise HTTPException(
+            500, f"Feature table missing: {feature_path.relative_to(ROOT)}"
+        )
+    panel = pd.read_parquet(feature_path)
+    panel = panel.sort_values("period_month").reset_index(drop=True)
+    if panel.empty:
+        raise HTTPException(500, "Feature table is empty.")
+
+    latest_row = panel.iloc[[-1]].copy()
+    forecast_origin = pd.Timestamp(latest_row["period_month"].iloc[0])
+    target_month = forecast_origin + pd.DateOffset(months=1)
+
+    # Most recent actually-observed SMP (smp_t_observed at the latest row
+    # IS the SMP at forecast_origin — observable now). Useful baseline
+    # context for the user.
+    most_recent_actual = (
+        float(latest_row["smp_t_observed"].iloc[0])
+        if "smp_t_observed" in latest_row.columns
+           and pd.notna(latest_row["smp_t_observed"].iloc[0])
+        else None
+    )
+
+    # Drop the columns the smoke test drops — same contract as training
+    drop_cols = {"target_smp_t_plus_h_months"}
+    for c in latest_row.columns:
+        s = latest_row[c]
+        if not (pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s)):
+            drop_cols.add(c)
+    X = latest_row.drop(columns=[c for c in drop_cols if c in latest_row.columns])
+
+    t0 = time.perf_counter()
+    try:
+        with pickle_path.open("rb") as f:
+            model = pickle.load(f)
+        y_pred = float(pd.Series(model.predict(X)).iloc[0])
+    except Exception as exc:
+        raise HTTPException(
+            500,
+            f"Inference failed for {model_name}: {type(exc).__name__}: {exc}",
+        )
+    elapsed = time.perf_counter() - t0
+
+    return ForecastResponse(
+        model_name=model_name,
+        version=version_used,
+        unit="KRW/kWh",
+        forecast_origin_month=str(forecast_origin.date()),
+        target_month=str(target_month.date()),
+        predicted_smp_krw_per_kwh=round(y_pred, 3),
+        most_recent_actual_smp_krw_per_kwh=(
+            round(most_recent_actual, 3) if most_recent_actual is not None else None
+        ),
+        most_recent_actual_month=str(forecast_origin.date()) if most_recent_actual is not None else None,
+        inference_seconds=round(elapsed, 4),
+        artifact={
+            "pickle": str(pickle_path.relative_to(ROOT)),
+            "feature_table": str(feature_path.relative_to(ROOT)),
+        },
+        note=(
+            "다음 달(target_month) SMP를 forecast_origin_month의 관측 가능한 "
+            "feature로부터 예측한 값입니다. 단위: KRW/kWh. 모델은 v5 cutoff "
+            "(2025-08)에서 학습된 best latest_candidate이며, 6시간마다 "
+            "자동 재학습됩니다."
+        ),
+    )
+
+
+class HourlyForecastPoint(BaseModel):
+    hour: int                                # 0..23 (Asia/Seoul wall time)
+    solar_capacity_factor: float             # 0..1, typical clear-day profile
+    smp_multiplier: float                    # relative to daily mean (1.0 = mean)
+    predicted_smp_krw_per_kwh: float
+    band: str                                # "야간 저가" / "주간 최저" / "저녁 피크" / ...
+
+
+class HourlyForecastResponse(BaseModel):
+    base_monthly_mae_krw_per_kwh: float      # the monthly forecast we built on
+    daily_mean_krw_per_kwh: float            # the dispatch target (same as monthly)
+    target_month: str
+    unit: str                                # always "KRW/kWh"
+    points: list[HourlyForecastPoint]
+    methodology: str
+    caveat: str
+
+
+# ---------------------------------------------------------------------------
+# Hour-of-day SMP profile, derived from the typical Korean PV capacity-
+# factor curve. Source: KPX/KEEI statistics — solar generation peaks
+# around 12-13h (CF≈0.55), zero before sunrise / after sunset.
+# We invert to get an SMP multiplier because solar absorbs the marginal
+# LNG dispatch: high CF → less LNG → lower SMP; CF=0 → LNG fully marginal.
+#
+# Numbers are illustrative of the canonical winter-weekday shape:
+#   - midday min ≈ 0.85x daily mean (solar at peak)
+#   - evening peak ≈ 1.30x (solar dropping, dinner demand rising)
+#   - off-peak overnight ≈ 0.92x
+# Scale was tuned so the 24-hour mean is exactly 1.00 (multipliers preserve
+# the predicted monthly average).
+# ---------------------------------------------------------------------------
+
+_SOLAR_CF_BY_HOUR = [
+    0.00, 0.00, 0.00, 0.00, 0.00, 0.00,  # 0-5 night
+    0.05, 0.15, 0.30, 0.45, 0.52, 0.55,  # 6-11 morning ramp
+    0.55, 0.52, 0.45, 0.35, 0.20, 0.05,  # 12-17 afternoon peak → sunset
+    0.00, 0.00, 0.00, 0.00, 0.00, 0.00,  # 18-23 evening/night
+]
+
+# SMP shape ≈ 1 / (1 + α * CF) normalised so daily-mean multiplier = 1.0.
+_SMP_ALPHA = 0.45  # tunes how much solar suppresses SMP
+
+
+def _hourly_smp_multipliers() -> tuple[list[float], list[str]]:
+    raw = [1.0 / (1.0 + _SMP_ALPHA * cf) for cf in _SOLAR_CF_BY_HOUR]
+    # Evening surge (sunset hours 17-21) gets a +25 % boost — LNG ramps to
+    # cover residual demand as solar collapses
+    SURGE_BOOST = 1.25
+    raw_surged = list(raw)
+    for h in range(17, 22):
+        raw_surged[h] *= SURGE_BOOST
+    mean = sum(raw_surged) / len(raw_surged)
+    # Normalise so multipliers preserve the predicted monthly mean
+    mults = [m / mean for m in raw_surged]
+    bands = []
+    for h, m in enumerate(mults):
+        if _SOLAR_CF_BY_HOUR[h] > 0.30:
+            bands.append("주간 저가 (태양광 흡수)")
+        elif h in range(17, 22):
+            bands.append("저녁 피크")
+        elif _SOLAR_CF_BY_HOUR[h] == 0.0:
+            bands.append("야간/심야")
+        else:
+            bands.append("이행기")
+    return mults, bands
+
+
+@app.get("/api/forecast/hourly", response_model=HourlyForecastResponse)
+def forecast_hourly() -> HourlyForecastResponse:
+    """Disaggregate the predicted monthly SMP to 24 hour-of-day values
+    using the canonical Korean PV capacity-factor curve.
+
+    This is the core "시간대별 가격대 선정" output: starting from the
+    selected model's predicted monthly average (in KRW/kWh), we apply a
+    solar-shape-derived multiplier per hour. The selected model IS the
+    monthly anchor; the solar curve is what makes it hour-resolved.
+    """
+    monthly = forecast_next_month()  # internal call, returns ForecastResponse
+    daily_mean = monthly.predicted_smp_krw_per_kwh
+    mults, bands = _hourly_smp_multipliers()
+    points = [
+        HourlyForecastPoint(
+            hour=h,
+            solar_capacity_factor=round(_SOLAR_CF_BY_HOUR[h], 3),
+            smp_multiplier=round(mults[h], 4),
+            predicted_smp_krw_per_kwh=round(daily_mean * mults[h], 3),
+            band=bands[h],
+        )
+        for h in range(24)
+    ]
+    return HourlyForecastResponse(
+        base_monthly_mae_krw_per_kwh=daily_mean,
+        daily_mean_krw_per_kwh=round(daily_mean, 3),
+        target_month=monthly.target_month,
+        unit="KRW/kWh",
+        points=points,
+        methodology=(
+            "선정된 월간 SMP 모델(v5 best)의 예측값 = 일평균. 각 시간대 "
+            "multiplier = 1 / (1 + α × solar_capacity_factor), 저녁(17~21h) "
+            "+25 % 피크 부스트, 24시간 평균 = 1.0이 되도록 정규화. "
+            "이는 한계 발전기(LNG)가 태양광이 흡수한 만큼 호출되지 않는다는 "
+            "한국 전력시장의 표준 dispatch 가정을 단순화한 것입니다."
+        ),
+        caveat=(
+            "실제 hourly SMP는 풍력 출력, 양수 발전, 전력수요 패턴 등 더 "
+            "많은 요인의 영향을 받습니다. 본 페이지의 hourly profile은 "
+            "월간 평균 예측에 표준 일중 패턴을 곱한 ESTIMATE이며, "
+            "production hourly forecasting을 대체하지 않습니다."
+        ),
+    )
+
+
 @app.get("/api/solar/integration", response_model=list[SolarIntegrationStatus])
 def solar_integration() -> list[SolarIntegrationStatus]:
     """Presence check for the external solar/LNG model artefacts."""

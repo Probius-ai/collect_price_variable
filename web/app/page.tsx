@@ -3,6 +3,8 @@ import { RetrainPanel } from "./_components/RetrainPanel";
 import { ComparisonTable } from "./_components/ComparisonTable";
 import { MetricCard } from "./_components/MetricCard";
 import { SolarStatus } from "./_components/SolarStatus";
+import { PriceHero } from "./_components/PriceHero";
+import { HourlyChart } from "./_components/HourlyChart";
 
 // Server component — fetches on the server at request time so the first
 // paint already has data. The retrain panel is the only piece that
@@ -20,11 +22,14 @@ async function safeFetch<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
 export const dynamic = "force-dynamic"; // always re-fetch — comparison.csv changes
 
 export default async function HomePage() {
-  const [recommendation, comparison, solar] = await Promise.all([
-    safeFetch(api.recommendation, null),
-    safeFetch(api.comparison, null),
-    safeFetch(api.solarIntegration, []),
-  ]);
+  const [recommendation, comparison, solar, forecast, hourly] =
+    await Promise.all([
+      safeFetch(api.recommendation, null),
+      safeFetch(api.comparison, null),
+      safeFetch(api.solarIntegration, []),
+      safeFetch(api.forecastNext, null),
+      safeFetch(api.forecastHourly, null),
+    ]);
 
   if (!recommendation || !comparison) {
     return (
@@ -94,9 +99,28 @@ export default async function HomePage() {
         </p>
       </header>
 
+      {/* Price hero — the actual KRW/kWh number the selection service exists to produce */}
+      <PriceHero forecast={forecast} />
+
+      {/* Hourly profile — disaggregates the monthly forecast to 24 hours via solar shape */}
+      {hourly && (
+        <section className="space-y-3">
+          <h2 className="text-xl font-semibold">
+            시간대별 가격대 (태양광 capacity factor 기반)
+          </h2>
+          <p className="text-sm text-slate-600">
+            위에서 선정된 모델의 <strong>다음 달 평균 SMP</strong>를 daily mean으로
+            두고, 태양광 발전 CF가 LNG 화력 호출량을 좌우한다는 dispatch 가정
+            하에 24시간 가격을 산정합니다. 정오 = 태양광 피크 = SMP 저점,
+            저녁 17-21h = 태양광 collapse + 수요 피크 = SMP 최대.
+          </p>
+          <HourlyChart data={hourly} />
+        </section>
+      )}
+
       {/* Decision panel */}
       <section className="space-y-3">
-        <h2 className="text-xl font-semibold">의사결정 패널</h2>
+        <h2 className="text-xl font-semibold">선정 근거 — 모델 비교</h2>
         <p className="text-sm text-slate-600">
           MAE 기준. 추천 모델은 (1) v1~v4 holdout 평균 우수 + (2) v5 rolling
           검증 안정성을 함께 본 결과입니다.
