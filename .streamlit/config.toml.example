@@ -1,27 +1,30 @@
 # Streamlit configuration — SAFE DEFAULTS.
 #
-# Copy this file to `.streamlit/config.toml` and tune for your machine.
-# The destination is gitignored so each developer can pick their own
-# binding / CORS / XSRF posture without forcing it on the rest of the
-# team.
+# Copy this file to `.streamlit/config.toml` and edit there. The
+# destination is gitignored, so each developer can pick their own
+# binding / CORS / XSRF posture without forcing it on the rest of
+# the team.
 #
-# Default posture below: localhost-only, all built-in protections ON.
-# Loopback binding is the safest setting for development workstations.
+# Default posture: localhost-only, all built-in protections ON.
+# Loopback binding is the safest setting for a development workstation
+# and is what should be used unless you have a specific need to expose
+# the dashboard beyond your machine.
 
 [server]
-# Bind to loopback by default — only this machine can connect.
-# Change to "0.0.0.0" ONLY if you understand the implications below.
+# Bind to loopback — only processes on THIS machine can connect.
 address = "127.0.0.1"
 port = 8501
 
-# Don't try to open a browser window when launched (e.g. over SSH).
+# Headless = don't try to open a browser window when launched (useful
+# over SSH and inside containers).
 headless = true
 
 # XSRF + CORS protections are ON by default. These are what stop
-# untrusted pages elsewhere on the same machine (or network, if bound
-# to 0.0.0.0) from initiating cross-site requests to your dashboard.
-# Disabling them only makes sense in combination with binding to a
-# trusted network — see the LAN section below.
+# untrusted pages elsewhere from initiating cross-site requests to
+# your dashboard. With loopback binding they are not load-bearing
+# (no remote origin can reach you), but with a non-loopback bind they
+# become the only thing standing between an attacker on the same
+# network and a session-hijack.
 enableCORS = true
 enableXsrfProtection = true
 
@@ -35,31 +38,63 @@ gatherUsageStats = false
 [theme]
 base = "light"
 
+
 # ---------------------------------------------------------------------------
-# Opt-in: LAN / public-IP access
+# If you need to expose the dashboard beyond this machine
 # ---------------------------------------------------------------------------
 #
-# The dashboard is read-only but exposes every metric, prediction, CSV,
-# and parquet artefact under data/ and outputs/. The Page 9 raw-envelope
-# preview is scrubbed by `_redact_preview`, so credentials in API
-# responses don't render, but everything else (model performance,
-# feature tables, intermediate aggregations) is visible to anyone who
-# can reach this host on port 8501.
+# READ THIS FIRST. The dashboard is read-only but exposes every metric,
+# prediction, CSV, and parquet under data/ and outputs/. Page 9's raw-
+# envelope preview is scrubbed by `_redact_preview` so credentials in
+# API responses don't render — but model performance, feature tables,
+# weather observations, intermediate aggregations, and everything in
+# the snapshots directory remain fully visible to anyone who can reach
+# this host on port 8501.
 #
-# Only flip the settings below when:
-#   * the host is on a trusted network (e.g. home LAN behind NAT,
-#     or a tailnet), AND
-#   * you've verified nothing under data/ or outputs/ is sensitive.
+# Pick the approach that gives you the least exposure for your use case.
 #
-# To enable LAN access, comment out the four lines above marked
-# "SAFE DEFAULTS" and uncomment these:
+# OPTION 1 — RECOMMENDED: tunnel (any network, no router config needed)
+# ---------------------------------------------------------------------
+# Keep this file as-is (loopback bind) and run one of:
 #
-# [server]
-# address = "0.0.0.0"        # listen on every interface
-# enableCORS = false         # required for non-localhost browsers
-# enableXsrfProtection = false  # required for non-localhost websocket
+#   tailscale funnel 8501
+#   cloudflared tunnel --url http://localhost:8501
+#   ngrok http 8501
 #
-# For public-internet exposure prefer a tunnel (tailscale funnel,
-# cloudflared, ngrok) over binding to 0.0.0.0 and opening the port
-# on your router — tunnels handle TLS termination and don't require
-# disabling Streamlit's built-in protections.
+# These terminate TLS for you, don't require disabling Streamlit's
+# built-in protections, and don't open a listening socket on every
+# network interface of your laptop. Most also provide per-user auth.
+#
+# OPTION 2 — bind to a specific trusted LAN interface
+# ---------------------------------------------------------------------
+# If you know exactly which interface is on the trusted LAN (e.g. your
+# home wired ethernet, NOT a coffee-shop wifi adapter), replace the
+# `[server]` section above with:
+#
+#     [server]
+#     address = "192.168.1.42"   # ← YOUR specific LAN IP, not 0.0.0.0
+#     port = 8501
+#     headless = true
+#     enableCORS = false
+#     enableXsrfProtection = false
+#     runOnSave = false
+#
+# Binding to a SPECIFIC interface (rather than 0.0.0.0) means a laptop
+# that later joins an untrusted network won't suddenly serve on that
+# network. Find your LAN IP with `ip -4 addr` and pick the one in your
+# trusted subnet.
+#
+# Note: enableCORS=false + enableXsrfProtection=false are required for
+# non-localhost browsers to load the websocket. With protections off,
+# any other host on the same LAN can read every byte the dashboard
+# renders AND can trigger reruns via crafted requests.
+#
+# OPTION 3 — last resort: bind to every interface (0.0.0.0)
+# ---------------------------------------------------------------------
+# Only do this if you cannot determine the LAN IP in advance and the
+# host will ONLY ever be on trusted networks. Same caveats as Option 2
+# but worse: any future wifi/VPN/Docker bridge interface inherits the
+# exposure. Same `[server]` block as Option 2 with `address = "0.0.0.0"`.
+#
+# Whichever you pick, do NOT commit `.streamlit/config.toml` — it's
+# gitignored for a reason. Each clone should make its own decision.
