@@ -297,28 +297,43 @@ def _evaluate_latest_rolling_validation(
     window_months: int,
     horizon_months: int = 1,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Backward walk-forward over the last `window_months` months ending
-    at `data_cutoff_month`.
+    """Backward walk-forward, observable-label-only.
 
-    For each month m in [cutoff - window+1 ... cutoff], fit a fresh model
-    on rows whose TARGET is observable strictly before m (i.e.
-    period_month + horizon < m), and predict the target at m. This is the
-    "production-like" evaluation used when no future holdout labels exist.
+    Two leak-safety constraints, BOTH required to honour v5's spec
+    "do not fabricate future labels":
 
-    Key leak-safety detail: we filter by ``period_month + horizon < m``,
-    NOT ``period_month < m`` — the latter would let a fold's training
-    pool include a row whose target IS m or beyond, leaking the eval
-    label into training.
+      1. **Eval months are bounded by target observability.** The latest
+         eval month is ``cutoff - horizon``, not ``cutoff``. For h=1,
+         scoring against ``m = cutoff`` would mean comparing the
+         prediction against ``SMP(cutoff + 1)`` — a value that doesn't
+         exist at the simulated retraining moment. The rolling window
+         is the last ``window_months`` months whose target is observable.
+
+      2. **Per-fold training mask is target-bounded too.** For each fold
+         month m, training rows are those where ``period_month + horizon
+         < m`` (the row's TARGET landed strictly before m). The looser
+         ``period_month < m`` would let in rows whose target IS m or
+         later — leaking the fold's eval label into its training fit.
+
+    Together: every (train_target, eval_target) pair satisfies
+    train_target < eval_target ≤ cutoff.
     """
     pm = pd.to_datetime(panel["period_month"])
     target_month = pm + pd.DateOffset(months=horizon_months)
+
+    # Latest eval month whose TARGET is observable at the simulated cutoff
+    latest_eval_month = data_cutoff_month - pd.DateOffset(months=horizon_months)
     months = pd.date_range(
-        end=data_cutoff_month, periods=window_months, freq="MS"
+        end=latest_eval_month, periods=window_months, freq="MS"
     )
+
     rows: list[dict[str, Any]] = []
     for m in months:
+        # Train: row's target must land strictly before this fold's eval
         train_mask = (target_month < m) & panel[target_col].notna()
         train = panel.loc[train_mask]
+        # Eval: single row at this fold's month, whose target IS by
+        # construction observable at the cutoff (we bounded `months` above).
         eval_row = panel.loc[(pm == m) & panel[target_col].notna()]
         if eval_row.empty or train.empty:
             continue

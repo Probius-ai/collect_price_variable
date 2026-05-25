@@ -217,6 +217,48 @@ def test_v5_uses_latest_rolling_validation_when_no_future_holdout(
         assert v5[col].isna().all() or (v5[col] == "None").all() or (v5[col] == "").all()
 
 
+def test_v5_rolling_validation_never_scores_target_beyond_cutoff(
+    synthetic_panel: Path, tmp_path: Path,
+):
+    """v5's spec is explicit: do not fabricate future labels. The rolling
+    eval window's LATEST fold must have target month <= cutoff. Earlier
+    versions of the rolling code stopped the window AT the cutoff itself,
+    which scored against `SMP(cutoff + horizon)` — a label that doesn't
+    exist at the simulated retraining moment.
+
+    This canary calls the rolling helper directly with the synthetic panel
+    and asserts every eval fold's target month is <= cutoff.
+    """
+    from src.pipelines.mlops_smoke_test import _evaluate_latest_rolling_validation
+    from src.models.naive import PersistenceMonthly
+
+    df = pd.read_parquet(synthetic_panel)
+    cutoff = pd.Timestamp("2025-08-01")
+    horizon = 1
+    preds, _metrics = _evaluate_latest_rolling_validation(
+        PersistenceMonthly, df,
+        target_col="target_smp_t_plus_h_months",
+        data_cutoff_month=cutoff,
+        window_months=12,
+        horizon_months=horizon,
+    )
+    assert not preds.empty, "rolling validation returned no folds"
+    eval_months = pd.to_datetime(preds["period_month"])
+    target_months = eval_months + pd.DateOffset(months=horizon)
+    # Critical invariant: every eval fold's TARGET is observable at cutoff
+    assert (target_months <= cutoff).all(), (
+        f"v5 rolling validation scored against future target(s): "
+        f"max target_month = {target_months.max()}, cutoff = {cutoff}. "
+        f"This fabricates a future label (SMP({target_months.max():%Y-%m})) "
+        f"that doesn't exist at the simulated retraining moment."
+    )
+    # And the window should be exactly 12 (for synthetic panel that has
+    # enough history before 2025-07).
+    assert len(preds) == 12, len(preds)
+    # Latest eval month is cutoff - horizon = 2025-07
+    assert eval_months.max() == pd.Timestamp("2025-07-01"), eval_months.max()
+
+
 def test_each_version_logs_mlflow_run_or_registry_record(
     smoke_results: pd.DataFrame, tmp_path: Path,
 ):
