@@ -58,3 +58,63 @@ def test_lightgbm_trains_and_predicts(feature_table):
     imp = m.feature_importance()
     assert not imp.empty
     assert {"feature", "importance_gain"}.issubset(imp.columns)
+
+
+def test_ridge_default_pool_excludes_sparse_jkm_daily_columns():
+    """Round-9-review fix: the JKM investing.com daily history starts in
+    2013, so `jkm_daily_*_lag_1m` columns are NaN for SMP months before
+    that. Ridge rejects NaN, so these columns MUST stay out of the default
+    auto-selected pool. (LightGBM tolerates NaN and gets these via its own
+    feature list — different model, different default.)
+    """
+    import numpy as np, pandas as pd
+    from src.models.ridge_model import RidgeModel, DEFAULT_RIDGE_FEATURES_MONTHLY
+
+    sparse_jkm = {
+        "jkm_daily_mean_lag_1m",
+        "jkm_daily_std_lag_1m",
+        "jkm_daily_range_lag_1m",
+    }
+    assert sparse_jkm.isdisjoint(DEFAULT_RIDGE_FEATURES_MONTHLY), (
+        "Sparse JKM daily-derived columns leaked back into the Ridge default pool. "
+        "These cause Ridge fits to fail with NaN errors on the pre-2013 portion of "
+        "the SMP monthly panel."
+    )
+
+    # Monthly frame that includes a sparse JKM column → Ridge auto-selects
+    # only the clean features and the fit succeeds.
+    n = 60
+    X = pd.DataFrame({
+        "smp_t_observed": np.linspace(80, 120, n),
+        "smp_lag_1m":     np.linspace(80, 120, n),
+        "jkm_daily_mean_lag_1m": [np.nan] * 20 + list(np.linspace(15, 20, 40)),
+    })
+    y = pd.Series(np.linspace(90, 130, n))
+    m = RidgeModel().fit(X, y)
+    assert "jkm_daily_mean_lag_1m" not in m.used_features
+    assert set(m.used_features) == {"smp_t_observed", "smp_lag_1m"}
+    # And the predict path works end-to-end
+    preds = m.predict(X)
+    assert len(preds) == n and not preds.isna().any()
+
+
+def test_ridge_pipeline_imputes_nans_when_explicit_features_have_them():
+    """Defense-in-depth: if a caller explicitly asks Ridge to use a column
+    that happens to contain NaN (e.g. feature-group ablation hands us a
+    set that includes a sparse column), the SimpleImputer step in Ridge's
+    pipeline imputes the NaN rather than letting sklearn raise.
+    """
+    import numpy as np, pandas as pd
+    from src.models.ridge_model import RidgeModel
+
+    n = 40
+    X = pd.DataFrame({
+        "smp_t_observed":  np.linspace(80, 120, n),
+        "some_sparse_col": [np.nan] * 10 + list(np.linspace(1.0, 5.0, 30)),
+    })
+    y = pd.Series(np.linspace(90, 130, n))
+    # Caller-specified features force the sparse column in
+    m = RidgeModel(feature_cols=["smp_t_observed", "some_sparse_col"]).fit(X, y)
+    preds = m.predict(X)
+    assert len(preds) == n
+    assert not preds.isna().any()

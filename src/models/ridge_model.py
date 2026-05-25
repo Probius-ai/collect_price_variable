@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -54,6 +55,14 @@ DEFAULT_RIDGE_FEATURES_MONTHLY = [
     "lng_price_usd_per_mmbtu_lag_1m",
     "lng_price_usd_per_mmbtu_lag_2m",
     "lng_price_chg_1m_lag_1m",
+    # NB: jkm_daily_{mean,std,range}_lag_1m are intentionally EXCLUDED from
+    # the Ridge default pool. The JKM investing.com daily history begins in
+    # 2013, so SMP months before that have NaN for these columns; sklearn's
+    # Ridge rejects NaN and the standard train/walk-forward paths do not
+    # impute after optional joins. LightGBM tolerates NaN natively and gets
+    # these columns through its own feature list. (See SimpleImputer step
+    # in `fit()` below as defence-in-depth — but excluding by default
+    # prevents Ridge from leaning on signal it then has to impute away.)
     # Settlement (wide-by-fuel, lag_1m) — added when settlement monthly is loaded.
     "settlement_unit_price_total_lag_1m",
     "settlement_unit_price_nuclear_lag_1m",
@@ -109,9 +118,15 @@ class RidgeModel:
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> "RidgeModel":
         self.used_features = self._select_features(X)
-        self.pipeline = Pipeline(
-            [("scaler", StandardScaler()), ("ridge", Ridge(alpha=self.alpha))]
-        )
+        # SimpleImputer defends against any selected column having NaN. The
+        # default pool tries to avoid sparse columns, but feature-group
+        # ablation can hand us any subset, and a future feature addition
+        # shouldn't silently break Ridge fits during walk-forward CV.
+        self.pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("ridge", Ridge(alpha=self.alpha)),
+        ])
         self.pipeline.fit(X[self.used_features].to_numpy(dtype=float), np.asarray(y, dtype=float))
         return self
 
