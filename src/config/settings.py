@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     kpx_public_api_key: str | None = Field(default=None)
     kpx_public_api_key_encoded: str | None = Field(default=None)
     kma_public_api_key: str | None = Field(default=None)
+    kma_public_api_key_encoded: str | None = Field(default=None)
     ecos_api_key: str | None = Field(default=None)
+    eia_api_key: str | None = Field(default=None)
 
     storage_backend: Literal["duckdb", "postgres"] = Field(default="duckdb")
     duckdb_path: Path = Field(default=Path("data/kpx_forecast.duckdb"))

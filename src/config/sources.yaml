@@ -5,6 +5,186 @@ defaults:
   request_timeout_seconds: 30
   timezone: Asia/Seoul
 file_sources:
+  raw_weather_monthly_db_file:
+    column_mapping:
+      cloud_cover_mean: cloud_cover_mean
+      hour_count: hour_count
+      humidity_mean: humidity_mean
+      period_month: period_month
+      rainfall_sum: rainfall_sum
+      region_name: region_name
+      temp_max: temp_max
+      temp_mean: temp_mean
+      temp_min: temp_min
+      temp_std: temp_std
+      wind_speed_mean: wind_speed_mean
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8
+    file_format: csv
+    filename_glob: weather_monthly_from_db.csv
+    frequency: monthly
+    last_verified_at: '2026-05-26'
+    limitations:
+    - 'Source: solar_beam.raw_weather (KMA ASOS hourly → monthly aggregate
+      via SQL extract). 17개 시도 × 60개월 (2020-01 ~ 2024-12).'
+    - HISTORICAL observation (not forecast). Use as exogenous backtest
+      variable; for forward-looking signal use kma_village_fcst.
+    - Aggregates derived in SQL (mean/std/min/max temp + mean humidity /
+      cloud_cover / wind_speed + sum rainfall). Hourly raw data is not
+      mirrored to this project.
+    official_name: 'solar_beam.raw_weather monthly aggregates (mean/std temp +
+      humidity/cloud/wind/rain)'
+    schema_version: 1
+    source_id: raw_weather_monthly_db_file
+    source_priority: 1
+    source_url: postgresql://devine.my:5432/solar_beam.raw_weather
+    unit: mixed_celsius_pct_mps_mm
+  kma_grid_xy_mapping_file:
+    column_mapping:
+      admin_code: 행정구역코드
+      kind: 구분
+      level1: 1단계
+      level2: 2단계
+      level3: 3단계
+      lat_deg: 위도(시)
+      lat_min: 위도(분)
+      lat_sec: 위도(초)
+      lng_deg: 경도(시)
+      lng_min: 경도(분)
+      lng_sec: 경도(초)
+      nx: 격자 X
+      ny: 격자 Y
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8
+    file_format: xlsx
+    filename_glob: kma_grid_xy_mapping.xlsx
+    frequency: reference
+    header_row: 0
+    last_verified_at: '2026-05-26'
+    limitations:
+    - 'Source: 기상청 단기예보 활용가이드 별첨 (2510 = 25년 10월 발표 버전).
+      3835 행정구역 × (nx, ny) + 위경도 매핑. 단기예보/초단기 API의 nx/ny 인자
+      해석 reference 용도. SMP forecaster 자체에는 join 안 함 — 코드에서 정적
+      lookup용으로 사용.'
+    official_name: 기상청 단기예보 격자(X,Y)-위경도 매핑 (전국 동/읍/면)
+    schema_version: 1
+    sheet_name: 0
+    source_id: kma_grid_xy_mapping_file
+    source_priority: 1
+    source_url: https://www.data.go.kr/data/15084084/openapi.do
+    unit: grid_cells
+  jkm_lng_daily_history_file:
+    column_mapping:
+      change_pct: Change %
+      close: Price
+      high: High
+      low: Low
+      open: Open
+      trade_date: Date
+      volume: Vol.
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8-sig
+    file_format: csv
+    filename_glob: jkm_daily_history.csv
+    frequency: daily
+    last_verified_at: '2026-05-26'
+    limitations:
+    - 'Source: investing.com JKM LNG futures historical (PLATTS, front-month).
+      Daily OHLC; date format MM/DD/YYYY US.'
+    - Spot/front-month — NOT the forward curve. Use jkm_lng_futures_curve_file
+      for forward expectations.
+    - Volume column may be empty (low liquidity on many days).
+    - 'Resampled to monthly by build_lng_forecast_features as alternative
+      LNG history with daily granularity (richer than FRED PNGASJPUSDM).'
+    official_name: JKM LNG PLATTS daily historical (investing.com)
+    schema_version: 1
+    source_id: jkm_lng_daily_history_file
+    source_priority: 1
+    source_url: https://www.investing.com/commodities/lng-japan-korea-marker-platts-futures-historical-data
+    trade_date_format: '%m/%d/%Y'
+    unit: USD/MMBtu
+  jkm_lng_futures_curve_file:
+    column_mapping:
+      contract_code: Code
+      contract_month_label: Month
+      prior_settle: Prior_Settle
+      quote_date: Date
+      quote_time_ct: Time_CT
+      volume: Volume
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8
+    file_format: csv
+    filename_glob: lng_jkm_quotes.csv
+    frequency: snapshot
+    last_verified_at: '2026-05-26'
+    limitations:
+    - 'Source: CME JKM LNG futures forward curve (front-month + further-out).
+      Single snapshot per file; quote_date is the as-of date.'
+    - This IS the leading-indicator the rest of the pipeline needs — at
+      forecast_origin_month M, the contract whose contract_month_label =
+      M+h gives the market''s expectation of LNG at M+h.
+    - 'Historical forward curves are NOT included (one snapshot only) →
+      can only inform forecasts FROM the quote_date onwards; backtesting
+      with this source requires multiple snapshots accumulated over time.'
+    - 'Code format JKMXY where X = contract month letter (F=Jan, G=Feb,
+      H=Mar, J=Apr, K=May, M=Jun, N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec)
+      and Y = single-digit year (0..9, rolling).'
+    official_name: CME JKM LNG futures forward curve snapshot
+    quote_date_format: '%d %b %Y'
+    schema_version: 1
+    source_id: jkm_lng_futures_curve_file
+    source_priority: 1
+    source_url: https://www.cmegroup.com/markets/energy/natural-gas/lng-japan-korea-marker-platts-swap.quotes.html
+    unit: USD/MMBtu
+  oil_price_monthly_file:
+    column_mapping:
+      oil_price_usd_per_bbl: oil_price_usd_per_bbl
+      period_month: period_month
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8
+    file_format: csv
+    filename_glob: oil_price_monthly.csv
+    frequency: monthly
+    last_verified_at: '2026-05-26'
+    limitations:
+    - Source = FRED POILDUBUSDM (Dubai crude monthly average, USD per barrel).
+      Exported from solar_beam PostgreSQL `oil_price` table.
+    - Monthly avg; published with similar lag profile to LNG (~mid-M+1).
+      Used as exogenous input to the LNG forecaster (round 7).
+    official_name: FRED POILDUBUSDM monthly Dubai crude price
+    schema_version: 1
+    source_id: oil_price_monthly_file
+    source_priority: 1
+    source_url: https://fred.stlouisfed.org/series/POILDUBUSDM
+    unit: USD/barrel
+  fx_usd_krw_monthly_file:
+    column_mapping:
+      period_month: period_month
+      usd_krw_monthly_avg: usd_krw_monthly_avg
+    drop_rows_after_header: 0
+    drop_rows_before: 0
+    encoding: utf-8
+    file_format: csv
+    filename_glob: usd_krw_monthly.csv
+    frequency: monthly
+    last_verified_at: '2026-05-26'
+    limitations:
+    - Source = FRED DEXKOUS (daily USD/KRW exchange rate) → resampled to
+      monthly mean in solar/ DB extraction.
+    - Monthly mean is fully observable at end-of-M (daily ECOS data is
+      available next day with negligible lag), so the unlagged value IS a
+      legitimate feature for forecasting M+1 LNG.
+    official_name: USD/KRW monthly average (FRED DEXKOUS resampled)
+    schema_version: 1
+    source_id: fx_usd_krw_monthly_file
+    source_priority: 1
+    source_url: https://fred.stlouisfed.org/series/DEXKOUS
+    unit: KRW/USD
   lng_price_monthly_file:
     column_mapping:
       lng_price_usd_per_mmbtu: lng_price_usd_per_mmbtu
@@ -466,6 +646,78 @@ file_sources:
     source_url: TBD_AFTER_FIRST_DOWNLOAD
     unit: KRW/kWh
 sources:
+  eia_steo:
+    base_url: https://api.eia.gov/v2/steo/data/
+    description: 'EIA Short-Term Energy Outlook (STEO) monthly forecast series.
+      Each report at month M contains historical observations up to M and
+      forecasts for M+1 through ~24 months ahead.'
+    expected_frequency: monthly
+    last_verified_at: '2026-05-26'
+    official_name: EIA Short-Term Energy Outlook (STEO)
+    series_ids:
+    - BREPUUS
+    - WTIPUUS
+    - NGHHMCF
+    source_fact_checked: true
+    source_url: https://www.eia.gov/outlooks/steo/data/browser/
+    verified_columns:
+    - source_id
+    - period_month
+    - series_id
+    - value
+    - units
+  kma_village_fcst:
+    base_url: http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst
+    description: '기상청 단기예보 (3-5일). 8회/일 발표 (02/05/08/11/14/17/20/23 :10
+      이후). 격자별 TMP/TMN/TMX/SKY/PTY/POP/PCP/REH/WSD 등 다수 카테고리.
+      서비스가 활성화되어 NORMAL_SERVICE 반환 확인 (2026-05-26).'
+    default_regions:
+    - name: Seoul
+      nx: 60
+      ny: 127
+    - name: Busan
+      nx: 98
+      ny: 76
+    - name: Daegu
+      nx: 89
+      ny: 90
+    expected_frequency: 8_per_day
+    last_verified_at: '2026-05-26'
+    official_name: 기상청 단기예보 조회서비스 2.0 (getVilageFcst)
+    source_fact_checked: true
+    source_url: https://www.data.go.kr/data/15084084/openapi.do
+    verified_columns:
+    - source_id
+    - region_name
+    - base_date
+    - base_time
+    - nx
+    - ny
+    - fcst_date
+    - fcst_time
+    - category
+    - fcst_value
+    - fcst_value_numeric
+  kma_mid_temperature:
+    base_url: http://apis.data.go.kr/1360000/MidFcstInfoService/getMidTa
+    description: '기상청 중기 기온 예보 (3~10일). regId별 일자별 최고/최저 기온.
+      매일 06시·18시 발표. 주요 지역 코드: 11B10101=서울, 11H20201=부산, 11H10701=대구.'
+    default_region_ids:
+    - 11B10101
+    - 11H20201
+    - 11H10701
+    expected_frequency: daily
+    last_verified_at: '2026-05-26'
+    official_name: 기상청 중기 기온 예보 (MidFcstInfoService.getMidTa)
+    source_fact_checked: true
+    source_url: https://www.data.go.kr/data/15059468/openapi.do
+    verified_columns:
+    - source_id
+    - reg_id
+    - tm_fc
+    - forecast_date
+    - ta_min
+    - ta_max
   kma_asos_hourly:
     column_mapping:
       humidity_pct: TBD_AFTER_FIRST_RESPONSE

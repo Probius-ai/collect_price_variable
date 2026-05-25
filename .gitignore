@@ -11,6 +11,13 @@ solar/
 solar_beam/
 additional_data/
 additional_data_2/
+additional_data_3/
+
+# Reference documents (KMA API guides, energy-forecast pipeline PDFs)
+# shared into the workspace for LLM context — not part of the repo.
+/*.pdf
+/*.docx
+/*.xlsx
 
 __pycache__/
 *.py[cod]

@@ -164,6 +164,90 @@ LNG_PRICE_MONTHLY_COLUMNS = [
     "source_file",
 ]
 
+# Round-7: FRED Dubai crude oil (exogenous for LNG forecast).
+OIL_PRICE_MONTHLY_COLUMNS = [
+    "source_id",
+    "period_month",
+    "oil_price_usd_per_bbl",
+    "collected_at",
+    "source_file",
+]
+
+# Round-7: USD/KRW monthly avg (exogenous for LNG forecast).
+FX_USD_KRW_MONTHLY_COLUMNS = [
+    "source_id",
+    "period_month",
+    "usd_krw_monthly_avg",
+    "collected_at",
+    "source_file",
+]
+
+# Round-9.2: solar_beam.raw_weather monthly aggregates (PostgreSQL → CSV).
+RAW_WEATHER_MONTHLY_DB_COLUMNS = [
+    "source_id",
+    "period_month",
+    "region_name",
+    "hour_count",
+    "temp_mean",
+    "temp_std",
+    "temp_min",
+    "temp_max",
+    "humidity_mean",
+    "cloud_cover_mean",
+    "wind_speed_mean",
+    "rainfall_sum",
+    "collected_at",
+    "source_file",
+]
+
+# Round-9: KMA 단기예보 격자(X,Y) ↔ 위경도 매핑 (정적 reference).
+KMA_GRID_XY_MAPPING_COLUMNS = [
+    "source_id",
+    "kind",
+    "admin_code",
+    "level1",
+    "level2",
+    "level3",
+    "nx",
+    "ny",
+    "lng_deg",
+    "lng_min",
+    "lng_sec",
+    "lat_deg",
+    "lat_min",
+    "lat_sec",
+    "collected_at",
+    "source_file",
+]
+
+# Round-8: JKM LNG daily history (investing.com) — daily OHLC.
+JKM_DAILY_HISTORY_COLUMNS = [
+    "source_id",
+    "trade_date",
+    "close",
+    "open",
+    "high",
+    "low",
+    "volume",
+    "change_pct",
+    "collected_at",
+    "source_file",
+]
+
+# Round-8: CME JKM forward curve (one snapshot per file).
+JKM_FUTURES_CURVE_COLUMNS = [
+    "source_id",
+    "quote_date",
+    "contract_month_label",
+    "contract_month",
+    "contract_code",
+    "prior_settle",
+    "volume",
+    "quote_time_ct",
+    "collected_at",
+    "source_file",
+]
+
 
 # ---------------------------------------------------------------------------
 # Generic tabular reader (CSV + XLSX, single + multi-row headers)
@@ -894,6 +978,227 @@ class LngPriceMonthlyFileLoader(BaseFileLoader):
         )
 
 
+class OilPriceMonthlyFileLoader(BaseFileLoader):
+    """FRED POILDUBUSDM (Dubai crude monthly avg, USD/barrel)."""
+
+    source_name = "oil_price_monthly_file"
+
+    def required_columns(self) -> set[str]:
+        return set(OIL_PRICE_MONTHLY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        df = _coerce_numeric(df, ["oil_price_usd_per_bbl"])
+        df = df.dropna(subset=["oil_price_usd_per_bbl", "period_month"]).copy()
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[OIL_PRICE_MONTHLY_COLUMNS]
+            .sort_values("period_month")
+            .reset_index(drop=True)
+        )
+
+
+class RawWeatherMonthlyDbFileLoader(BaseFileLoader):
+    """Monthly aggregates of solar_beam.raw_weather (17 시도 × 60 months)."""
+
+    source_name = "raw_weather_monthly_db_file"
+
+    def required_columns(self) -> set[str]:
+        return set(RAW_WEATHER_MONTHLY_DB_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        for c in ["hour_count", "temp_mean", "temp_std", "temp_min", "temp_max",
+                  "humidity_mean", "cloud_cover_mean", "wind_speed_mean",
+                  "rainfall_sum"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["period_month", "region_name"]).copy()
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[RAW_WEATHER_MONTHLY_DB_COLUMNS]
+            .sort_values(["period_month", "region_name"])
+            .reset_index(drop=True)
+        )
+
+
+class KmaGridXyMappingFileLoader(BaseFileLoader):
+    """KMA 단기예보 격자(X,Y) ↔ 행정구역/위경도 매핑 (xlsx).
+
+    Reference table only — not joined into any feature pipeline; lookup
+    helper for resolving region name → (nx, ny) for `kma_village_fcst`
+    requests.
+    """
+
+    source_name = "kma_grid_xy_mapping_file"
+
+    def required_columns(self) -> set[str]:
+        return set(KMA_GRID_XY_MAPPING_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        df = _coerce_numeric(df, ["nx", "ny", "lng_deg", "lng_min", "lng_sec",
+                                   "lat_deg", "lat_min", "lat_sec"])
+        df = df.dropna(subset=["nx", "ny", "level1"]).copy()
+        df["nx"] = df["nx"].astype(int)
+        df["ny"] = df["ny"].astype(int)
+        for c in ["level1", "level2", "level3", "admin_code", "kind"]:
+            if c in df.columns:
+                df[c] = df[c].astype(str).fillna("").replace("nan", "")
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[KMA_GRID_XY_MAPPING_COLUMNS]
+            .sort_values(["level1", "level2", "level3"])
+            .reset_index(drop=True)
+        )
+
+
+class JkmLngDailyHistoryFileLoader(BaseFileLoader):
+    """investing.com JKM LNG daily historical OHLC."""
+
+    source_name = "jkm_lng_daily_history_file"
+
+    def required_columns(self) -> set[str]:
+        return set(JKM_DAILY_HISTORY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        fmt = self.config.get("trade_date_format") or "%m/%d/%Y"
+        df["trade_date"] = pd.to_datetime(
+            df["trade_date"].astype(str).str.strip(),
+            format=fmt, errors="coerce",
+        )
+        # Strip thousand-separators and the trailing '%' on change column.
+        for c in ["close", "open", "high", "low"]:
+            df[c] = pd.to_numeric(
+                df[c].astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            )
+        df["change_pct"] = pd.to_numeric(
+            df["change_pct"].astype(str).str.replace("%", "", regex=False)
+                                      .str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        # Volume can have suffixes like '1.2K'; just coerce to numeric with NaN.
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+        df = df.dropna(subset=["trade_date", "close"]).copy()
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[JKM_DAILY_HISTORY_COLUMNS]
+            .sort_values("trade_date")
+            .reset_index(drop=True)
+        )
+
+
+# CME contract-month letter code → month number (per CFTC convention)
+_CME_MONTH_CODE = {
+    "F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
+    "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12,
+}
+
+
+def _parse_jkm_contract_month(label: str, code: str, quote_date: pd.Timestamp) -> pd.Timestamp | None:
+    """Decode the contract delivery month.
+
+    `label` like 'JUL 2026' is unambiguous → prefer that. `code` like 'JKMN6'
+    is single-digit year (rolls every decade); we anchor it to the decade
+    of `quote_date` for disambiguation.
+    """
+    label = str(label or "").strip().strip('"')
+    if label:
+        try:
+            return pd.to_datetime(label, format="%b %Y")
+        except Exception:
+            pass
+    code = str(code or "").strip().strip('"')
+    if len(code) >= 5 and code.startswith("JKM"):
+        letter = code[3]
+        year_digit = code[4]
+        m = _CME_MONTH_CODE.get(letter.upper())
+        if m is None or not year_digit.isdigit():
+            return None
+        decade = (quote_date.year // 10) * 10
+        candidate = pd.Timestamp(year=decade + int(year_digit), month=m, day=1)
+        # Future-pick: contracts settle in the future of the quote date;
+        # if naive decade gives a date in the past, roll forward one decade.
+        if candidate < quote_date - pd.Timedelta(days=30):
+            candidate = pd.Timestamp(year=decade + 10 + int(year_digit), month=m, day=1)
+        return candidate
+    return None
+
+
+class JkmLngFuturesCurveFileLoader(BaseFileLoader):
+    """CME JKM forward curve snapshot."""
+
+    source_name = "jkm_lng_futures_curve_file"
+
+    def required_columns(self) -> set[str]:
+        return set(JKM_FUTURES_CURVE_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        fmt = self.config.get("quote_date_format") or "%d %b %Y"
+        df["quote_date"] = pd.to_datetime(
+            df["quote_date"].astype(str).str.strip().str.strip('"'),
+            format=fmt, errors="coerce",
+        )
+        df["prior_settle"] = pd.to_numeric(df["prior_settle"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["contract_month"] = df.apply(
+            lambda r: _parse_jkm_contract_month(
+                r["contract_month_label"], r["contract_code"], r["quote_date"]
+            ), axis=1,
+        )
+        df = df.dropna(subset=["quote_date", "contract_month", "prior_settle"]).copy()
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[JKM_FUTURES_CURVE_COLUMNS]
+            .sort_values(["quote_date", "contract_month"])
+            .reset_index(drop=True)
+        )
+
+
+class FxUsdKrwMonthlyFileLoader(BaseFileLoader):
+    """USD/KRW monthly average (FRED DEXKOUS resampled)."""
+
+    source_name = "fx_usd_krw_monthly_file"
+
+    def required_columns(self) -> set[str]:
+        return set(FX_USD_KRW_MONTHLY_COLUMNS)
+
+    def parse_file(self, file_path: Path) -> pd.DataFrame:
+        df = _read_tabular(file_path, self.config)
+        df = _rename_with_mapping(df, self.config["column_mapping"])
+        df["period_month"] = pd.to_datetime(df["period_month"])
+        df = _coerce_numeric(df, ["usd_krw_monthly_avg"])
+        df = df.dropna(subset=["usd_krw_monthly_avg", "period_month"]).copy()
+        df["source_id"] = self.source_name
+        df["collected_at"] = _now_str()
+        df["source_file"] = file_path.name
+        return (
+            df[FX_USD_KRW_MONTHLY_COLUMNS]
+            .sort_values("period_month")
+            .reset_index(drop=True)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -915,4 +1220,10 @@ LOADERS: dict[str, type[BaseFileLoader]] = {
     KpxTransactionAmountDailyByFuelFileLoader.source_name:
         KpxTransactionAmountDailyByFuelFileLoader,
     LngPriceMonthlyFileLoader.source_name: LngPriceMonthlyFileLoader,
+    OilPriceMonthlyFileLoader.source_name: OilPriceMonthlyFileLoader,
+    FxUsdKrwMonthlyFileLoader.source_name: FxUsdKrwMonthlyFileLoader,
+    JkmLngDailyHistoryFileLoader.source_name: JkmLngDailyHistoryFileLoader,
+    JkmLngFuturesCurveFileLoader.source_name: JkmLngFuturesCurveFileLoader,
+    KmaGridXyMappingFileLoader.source_name: KmaGridXyMappingFileLoader,
+    RawWeatherMonthlyDbFileLoader.source_name: RawWeatherMonthlyDbFileLoader,
 }

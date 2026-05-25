@@ -392,6 +392,150 @@ def load_transaction_amount_daily_long() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def load_jkm_daily_history_long() -> pd.DataFrame:
+    """investing.com JKM daily OHLC history (2013-01 onwards, ~2900 rows)."""
+    df = _load_one_source_parquet("jkm_lng_daily_history_file")
+    if not df.empty:
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+    return df.reset_index(drop=True)
+
+
+def build_jkm_daily_volatility_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """Aggregate JKM daily OHLC into monthly mean / std / range (lag_1m).
+
+    At forecast_origin_month M, the daily JKM prices for month M-1 are
+    fully observable (daily futures settles publish on the same day). We
+    expose:
+
+      * `jkm_daily_mean_lag_1m`   = mean of daily close in month M-1
+      * `jkm_daily_std_lag_1m`    = std of daily close (volatility signal)
+      * `jkm_daily_range_lag_1m`  = max-min over month M-1
+      * `jkm_daily_last_lag_1m`   = last trade in M-1 (end-of-month snap)
+
+    Lag_1m is mandatory here because at info_cutoff = end-of-M only
+    daily JKM through M-1 has had a chance to fully settle (the very last
+    daily print of M might not be fully cleared yet).
+    """
+    long = load_jkm_daily_history_long()
+    info = {
+        "source_id": "jkm_lng_daily_history_file",
+        "feature_origin_frequency": "daily_aggregated_to_monthly",
+        "rows_in_source": int(len(long)),
+        "period_range": None,
+        "missing_periods_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+
+    daily = long[["trade_date", "close"]].dropna().sort_values("trade_date").copy()
+    daily["period_month"] = daily["trade_date"].dt.to_period("M").dt.to_timestamp()
+    g = daily.groupby("period_month")["close"]
+    monthly = pd.DataFrame({
+        "jkm_daily_mean": g.mean(),
+        "jkm_daily_std": g.std(ddof=1),
+        "jkm_daily_max": g.max(),
+        "jkm_daily_min": g.min(),
+        "jkm_daily_last": g.last(),
+    }).reset_index()
+    monthly["jkm_daily_range"] = monthly["jkm_daily_max"] - monthly["jkm_daily_min"]
+
+    # Contiguous month grid extended by 1 (same trick as the round-6 LNG fix)
+    full = pd.date_range(monthly["period_month"].min(),
+                         monthly["period_month"].max() + pd.DateOffset(months=1),
+                         freq="MS")
+    monthly = monthly.set_index("period_month").reindex(full)
+    monthly.index.name = "period_month"
+    out = pd.DataFrame({
+        "jkm_daily_mean_lag_1m": monthly["jkm_daily_mean"].shift(1),
+        "jkm_daily_std_lag_1m": monthly["jkm_daily_std"].shift(1),
+        "jkm_daily_range_lag_1m": monthly["jkm_daily_range"].shift(1),
+        "jkm_daily_last_lag_1m": monthly["jkm_daily_last"].shift(1),
+    }).reset_index()
+
+    info["period_range"] = (str(out["period_month"].min()), str(out["period_month"].max()))
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    )
+    return out, info
+
+
+def load_jkm_futures_curve_long() -> pd.DataFrame:
+    """CME JKM forward curve snapshots (one row per (quote_date, contract_month))."""
+    df = _load_one_source_parquet("jkm_lng_futures_curve_file")
+    if not df.empty:
+        df["quote_date"] = pd.to_datetime(df["quote_date"])
+        df["contract_month"] = pd.to_datetime(df["contract_month"])
+    return df.reset_index(drop=True)
+
+
+def build_jkm_forward_features(period_months: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """True-leading indicator from the CME JKM forward curve.
+
+    For each row at SMP forecast_origin_month M, we look up the most recent
+    forward-curve snapshot whose ``quote_date`` is ≤ end-of-M (information_cutoff)
+    and emit:
+
+      * `jkm_forward_next_month_usd_per_mmbtu`  = price for contract whose
+        contract_month = M+1 (i.e. the market's expectation of LNG at M+1
+        as observed at forecast origin).
+      * `jkm_forward_M_plus_2_usd_per_mmbtu`    = M+2 contract.
+      * `jkm_forward_slope_1_2`                  = (M+2 − M+1) / M+1 (curve slope).
+
+    These are **legitimate leading features** for the SMP forecast at M+1
+    because they reflect forward-looking market consensus that IS available
+    at end-of-M.
+
+    Backtesting caveat: we usually have a *single* forward-curve snapshot
+    (the latest one, captured by the user). For historical SMP rows we
+    have no forward curve, so the values default to NaN. Practical impact:
+    only the most recent few SMP rows get filled — useful for INFERENCE,
+    not for training.
+    """
+    long = load_jkm_futures_curve_long()
+    info = {
+        "source_id": "jkm_lng_futures_curve_file",
+        "feature_origin_frequency": "monthly_forward_lookup",
+        "rows_in_source": int(len(long)),
+        "snapshots_available": (
+            sorted(set(map(str, long["quote_date"].dt.date.unique())))
+            if not long.empty else []
+        ),
+        "missing_periods_in_smp_index": 0,
+    }
+    if long.empty:
+        return pd.DataFrame(columns=["period_month"]), info
+
+    out_rows: list[dict] = []
+    for pm in period_months.drop_duplicates():
+        info_cutoff = pd.Timestamp(pm) + pd.offsets.MonthEnd(0)
+        # Pick the LATEST snapshot whose quote_date ≤ info_cutoff. This is
+        # the "what did the market know at end-of-M" lookup.
+        eligible = long[long["quote_date"] <= info_cutoff]
+        if eligible.empty:
+            continue
+        last_qd = eligible["quote_date"].max()
+        snap = eligible[eligible["quote_date"] == last_qd]
+        m_plus_1 = pd.Timestamp(pm) + pd.DateOffset(months=1)
+        m_plus_2 = pd.Timestamp(pm) + pd.DateOffset(months=2)
+        row1 = snap[snap["contract_month"] == m_plus_1]
+        row2 = snap[snap["contract_month"] == m_plus_2]
+        v1 = float(row1["prior_settle"].iloc[0]) if len(row1) else None
+        v2 = float(row2["prior_settle"].iloc[0]) if len(row2) else None
+        slope = (v2 - v1) / v1 if (v1 and v2) else None
+        out_rows.append({
+            "period_month": pd.Timestamp(pm),
+            "jkm_forward_next_month_usd_per_mmbtu": v1,
+            "jkm_forward_M_plus_2_usd_per_mmbtu": v2,
+            "jkm_forward_slope_1_2": slope,
+        })
+
+    out = pd.DataFrame(out_rows)
+    info["missing_periods_in_smp_index"] = int(
+        (~period_months.isin(out["period_month"])).sum()
+    ) if not out.empty else int(len(period_months))
+    return out, info
+
+
 def load_lng_price_monthly_long() -> pd.DataFrame:
     """FRED Asia LNG monthly price (USD/MMBtu), via solar_beam DB export.
 
@@ -1127,6 +1271,23 @@ def build_smp_monthly_features(
             lng_block = lng_block.drop_duplicates(subset=["period_month"], keep="last")
             feats = feats.merge(lng_block, on="period_month", how="left")
         optional_info["lng_price"] = lng_info
+
+        # JKM forward curve — true leading indicator (round 8). At forecast
+        # origin M, contract_month=M+1 price IS observable at end-of-M, so
+        # safe to use for forecasting SMP(M+1).
+        jkm_block, jkm_info = build_jkm_forward_features(feats["period_month"])
+        if not jkm_block.empty:
+            jkm_block = jkm_block.drop_duplicates(subset=["period_month"], keep="last")
+            feats = feats.merge(jkm_block, on="period_month", how="left")
+        optional_info["jkm_forward"] = jkm_info
+
+        # JKM daily volatility (lag_1m) — leak-safe leading-ish signal
+        # derived from daily JKM history (much richer than monthly FRED).
+        jkm_vol_block, jkm_vol_info = build_jkm_daily_volatility_features(feats["period_month"])
+        if not jkm_vol_block.empty:
+            jkm_vol_block = jkm_vol_block.drop_duplicates(subset=["period_month"], keep="last")
+            feats = feats.merge(jkm_vol_block, on="period_month", how="left")
+        optional_info["jkm_daily_volatility"] = jkm_vol_info
 
     # Hard invariant: optional joins must NOT change the SMP row count.
     if len(feats) != n_baseline_rows:
