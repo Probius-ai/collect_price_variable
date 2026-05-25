@@ -503,6 +503,73 @@ Kubernetes/AWS, no automatic production promotion, no copying/deleting
 raw files to simulate data arrival. The "staged retraining" is a
 filter-based simulation, not a real-data pipeline.
 
+## Web frontend (Next.js + FastAPI)
+
+A production-grade web UI for the model-selection decision, separate
+from the legacy Streamlit dashboard.
+
+* `api/` — **FastAPI** backend on port 8000. Read-only JSON endpoints
+  for the comparison table, recommendation, registry, solar-integration
+  status, and a `POST /api/retrain` that fires the same v1..v5 smoke
+  test the dashboard does.
+* `web/` — **Next.js 14** (App Router + TypeScript + Tailwind) on
+  port 3000. Server-rendered home page consumes the API; the retrain
+  button is a client component that polls `/api/retrain/status` every
+  5 seconds while a run is in flight.
+
+### Quick start
+
+```bash
+# One-time: install Next.js deps (Node 18+ required)
+make web-install
+
+# Terminal 1 — FastAPI backend
+make api
+
+# Terminal 2 — Next.js dev server
+make web
+
+# Visit: http://localhost:3000
+```
+
+Or run both manually:
+
+```bash
+.venv/bin/uvicorn api.main:app --reload --port 8000   # API
+cd web && npm run dev                                  # frontend
+```
+
+### Page layout
+
+The single home page at `/` (Korean UI by default) shows:
+
+| Section | Source |
+| --- | --- |
+| 의사결정 패널 (4 metric cards) | `GET /api/models/recommendation` |
+| 후보 모델 안정성 (v4 → v5 변화 표) | `GET /api/models/comparison` |
+| 왜 단기 태양광 예측이 SMP 모델 선정에 중요한가 | static markdown |
+| 외부 모델 인벤토리 (Solar / LNG) | `GET /api/solar/integration` |
+| 학습 트리거 (강제 재학습 버튼 + 6시간마다 자동 재학습 안내) | `POST /api/retrain` + polling |
+
+### Production build
+
+```bash
+make web-build                                        # builds .next/
+cd web && npm run start                               # serves :3000
+```
+
+For real deployment behind a reverse proxy, set
+`NEXT_PUBLIC_API_BASE=https://your-domain/api` in `web/.env.production`
+so the browser hits the same origin instead of `localhost:8000`.
+
+### Architecture note
+
+The FastAPI subprocess for retrain uses `sys.executable` so it works
+in any environment (Docker, fresh venv, etc.) — no hardcoded
+`.venv/bin/python`. The `outputs/_retrain_status.json` lock file is
+shared with the Streamlit dashboard's retrain button, so both UIs
+correctly detect "already running" state.
+
 ## License
 
 MIT.
