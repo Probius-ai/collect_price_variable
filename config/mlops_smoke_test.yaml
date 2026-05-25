@@ -1,0 +1,155 @@
+# MLOps smoke-test configuration — staged retraining simulation.
+#
+# Each "version" simulates a future state where more data has become
+# available, by filtering the feature table down to
+# ``period_month <= data_cutoff_month``. v1..v4 then evaluate against a
+# fixed forward holdout; v5 has no future holdout and instead does a
+# rolling backward-walk validation against the last 12 months of its
+# own training window.
+#
+# This is a SIMULATION, not real retraining — we don't replay collectors,
+# we just truncate the panel. The point is to exercise the MLflow logging
+# / registry-writing / report-generating workflow end-to-end so a class
+# demo can show "model retrained as new data arrived" without waiting
+# years for real data to accumulate.
+
+target:
+  feature_table: data/processed/smp_monthly_mainland_h1m.parquet
+  target_column: target_smp_t_plus_h_months
+  area: mainland
+  horizon_months: 1
+
+# ---------------------------------------------------------------------------
+# Versions
+# ---------------------------------------------------------------------------
+#
+# `data_cutoff_month` = "what we'd have known if we'd retrained at end of M".
+# Train uses rows where period_month <= data_cutoff_month AND target is
+# non-null. Evaluation depends on mode:
+#   * fixed_holdout — score on rows where test_start <= period_month <= test_end.
+#   * latest_rolling_validation — for each month in the last
+#     `rolling_window_months` months ENDING at data_cutoff_month,
+#     refit on prior data only and predict that month. No future labels
+#     are required.
+
+versions:
+  - name: v1
+    data_cutoff_month: "2021-12-01"
+    train_end: "2021-12-01"
+    test_start: "2022-01-01"
+    test_end: "2022-12-01"
+    evaluation_mode: fixed_holdout
+
+  - name: v2
+    data_cutoff_month: "2022-12-01"
+    train_end: "2022-12-01"
+    test_start: "2023-01-01"
+    test_end: "2023-12-01"
+    evaluation_mode: fixed_holdout
+
+  - name: v3
+    data_cutoff_month: "2023-12-01"
+    train_end: "2023-12-01"
+    test_start: "2024-01-01"
+    test_end: "2024-12-01"
+    evaluation_mode: fixed_holdout
+
+  - name: v4
+    data_cutoff_month: "2024-12-01"
+    train_end: "2024-12-01"
+    test_start: "2025-01-01"
+    test_end: "2025-08-01"
+    evaluation_mode: fixed_holdout
+
+  - name: v5
+    data_cutoff_month: "2025-08-01"
+    train_end: "2025-08-01"
+    evaluation_mode: latest_rolling_validation
+    rolling_window_months: 12
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+#
+# Each model is fit once per version. `kind`:
+#   * baseline   — persistence/seasonal/naive families
+#   * linear     — Ridge variants
+#   * delta      — Δ-target wrappers
+#   * tree       — LightGBM variants
+#   * neural     — MLP variants (currently controlled-skipped — not enough
+#                  training rows for a stable MLP at the v1 cutoff)
+#   * proxy      — fuel-proxy model (LNG/oil/fx-driven). Treated as a proxy
+#                  unless EIA STEO + JKM forward data are present.
+#
+# `min_train_rows` triggers controlled-skip (logged as a tag, not an
+# error) when the post-filter panel is too small.
+
+models:
+  - name: persistence_monthly
+    kind: baseline
+    min_train_rows: 24
+  - name: naive_lag_1m
+    kind: baseline
+    min_train_rows: 24
+  - name: seasonal_naive_lag_12m
+    kind: baseline
+    min_train_rows: 24
+
+  - name: ridge
+    kind: linear
+    min_train_rows: 36
+  - name: monthly_ar_ridge
+    kind: linear
+    min_train_rows: 36
+
+  - name: delta_ridge
+    kind: delta
+    min_train_rows: 36
+  - name: delta_ar_ridge
+    kind: delta
+    min_train_rows: 36
+
+  - name: lightgbm
+    kind: tree
+    min_train_rows: 48
+  - name: delta_lightgbm
+    kind: tree
+    min_train_rows: 48
+
+  # MLP is included as a controlled-skip example: monthly panel after
+  # filtering to v1 cutoff has < 132 rows, which is too small for a
+  # reliably-fitting MLP. We log the skip reason as an MLflow tag.
+  - name: mlp
+    kind: neural
+    min_train_rows: 132
+    skip_reason_if_underfit: |
+      Insufficient training rows for stable MLP fit.
+      Monthly panel only spans ~10 years; MLP needs ≥132 rows for the
+      default architecture to fit without overfitting noise.
+
+# ---------------------------------------------------------------------------
+# Promotion policy
+# ---------------------------------------------------------------------------
+#
+# We NEVER auto-promote to production. The smoke test only tags:
+#   * historical_backtest      — v1..v4 fixed-holdout runs
+#   * latest_candidate         — v5 (latest cutoff)
+#   * recommended_historical   — best v1..v4 by MAE across all models
+#
+# Anything else (production / staging) is left to a human operator.
+
+promotion:
+  primary_metric: mae
+  lower_is_better: true
+  historical_versions: ["v1", "v2", "v3", "v4"]
+  latest_version: v5
+
+# ---------------------------------------------------------------------------
+# Output destinations
+# ---------------------------------------------------------------------------
+
+outputs:
+  report_md:    outputs/reports/mlops_smoke_test_v1_v5_report.md
+  report_json:  outputs/reports/mlops_smoke_test_v1_v5_report.json
+  comparison_csv: outputs/metrics/mlops_version_comparison.csv
+  artifact_root: outputs/mlops_smoke_test  # per-version sub-dirs land here
