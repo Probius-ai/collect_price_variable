@@ -670,6 +670,64 @@ def _record_skip(
 # ---------------------------------------------------------------------------
 
 
+def _log_model_summary_runs(
+    *, results: list[VersionResult], log_to_mlflow: bool,
+) -> dict[str, str | None]:
+    """For each model, log one ADDITIONAL MLflow run that records v1..v5
+    metrics as a stepped series (step=1..5).
+
+    MLflow's Run-detail page natively renders a metric series with
+    distinct step values as a LINE chart, so this gives the user one
+    line chart per model spanning v1..v5 — instead of the default
+    one-bar-per-run view across the 35 individual runs.
+
+    The 35 individual (version, model) runs stay intact for artifact
+    access (predictions.csv, model.pkl). The summary runs only carry
+    the stepped metrics + run-level tags (summary=true, model_name=…)
+    so they can be filtered in the Runs table.
+
+    Returns a dict ``{model_name: summary_run_id}`` for downstream use.
+    """
+    summary_ids: dict[str, str | None] = {}
+    if not log_to_mlflow:
+        return summary_ids
+
+    by_model: dict[str, list[VersionResult]] = {}
+    for r in results:
+        by_model.setdefault(r.model_name, []).append(r)
+
+    for model_name, runs in by_model.items():
+        # v1, v2, …, v5 — sort numerically so step ordering is correct
+        runs_sorted = sorted(runs, key=lambda x: int(x.version.lstrip("v")))
+        with maybe_mlflow_run(
+            enable=True,
+            run_name=f"summary_{model_name}",
+            tags={
+                "summary": "true",
+                "model_name": model_name,
+                "smoke_test": "v1_v5",
+                "view_hint": "open Metrics tab for v1..v5 line chart",
+            },
+        ) as run:
+            run.log_params({
+                "model_name": model_name,
+                "n_versions": len(runs_sorted),
+                "versions": ",".join(r.version for r in runs_sorted),
+                "summary_kind": "v1_v5_line_chart",
+            })
+            for r in runs_sorted:
+                if not r.metrics or r.skipped:
+                    continue
+                step = int(r.version.lstrip("v"))
+                # Bulk-log every numeric metric at this step. MLflow
+                # treats each `step` value as a new data point on the
+                # metric's history → 5 points = 5-point line chart.
+                run.log_metrics(r.metrics, step=step)
+            summary_ids[model_name] = run.run_id
+
+    return summary_ids
+
+
 def build_comparison_dataframe(results: list[VersionResult]) -> pd.DataFrame:
     rows = []
     for r in results:
@@ -844,6 +902,11 @@ def run_smoke_test(
                 horizon_months=horizon_months,
             )
             results.append(result)
+
+    # After all individual (version, model) runs, log one summary run
+    # per model that records v1..v5 as a stepped metric series — gives
+    # MLflow's UI a native line-chart view per model.
+    _log_model_summary_runs(results=results, log_to_mlflow=log_to_mlflow)
 
     df = build_comparison_dataframe(results)
     df = _annotate_recommendations(

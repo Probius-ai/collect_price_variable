@@ -217,6 +217,100 @@ def test_v5_uses_latest_rolling_validation_when_no_future_holdout(
         assert v5[col].isna().all() or (v5[col] == "None").all() or (v5[col] == "").all()
 
 
+def test_log_model_summary_runs_emits_stepped_metric_series():
+    """Pin the data shape that makes MLflow render line charts.
+
+    For each model, the summary helper must:
+      * emit exactly one record per version that has metrics
+      * pass `step=N` (extracted from "vN") so MLflow's metric history
+        sees 5 distinct steps → renders as a 5-point line chart
+      * never emit a step for a skipped run (would inject NaN at a real
+        step and break the line)
+    """
+    from src.pipelines.mlops_smoke_test import _log_model_summary_runs, VersionResult
+
+    # Build a fake results set: 3 versions for "ridge", 2 of which have
+    # metrics + 1 skipped.
+    results = [
+        VersionResult(
+            version="v1", model_name="ridge", data_cutoff_month="2021-12-01",
+            train_end="2021-12-01", test_start="2022-01-01", test_end="2022-12-01",
+            evaluation_mode="fixed_holdout", n_train=10, n_test=12,
+            metrics={"mae": 20.0, "rmse": 25.0}, mlflow_run_id=None,
+            artifact_dir=None, skipped=False,
+        ),
+        VersionResult(
+            version="v2", model_name="ridge", data_cutoff_month="2022-12-01",
+            train_end="2022-12-01", test_start="2023-01-01", test_end="2023-12-01",
+            evaluation_mode="fixed_holdout", n_train=22, n_test=12,
+            metrics={"mae": 15.0, "rmse": 19.0}, mlflow_run_id=None,
+            artifact_dir=None, skipped=False,
+        ),
+        VersionResult(
+            version="v3", model_name="ridge", data_cutoff_month="2023-12-01",
+            train_end="2023-12-01", test_start="2024-01-01", test_end="2024-12-01",
+            evaluation_mode="fixed_holdout", n_train=34, n_test=12,
+            metrics={}, mlflow_run_id=None, artifact_dir=None,
+            skipped=True, skip_reason="synthetic skip",
+        ),
+    ]
+
+    # Capture what gets logged WITHOUT needing a live MLflow server by
+    # patching maybe_mlflow_run to yield a recording fake.
+    from unittest.mock import patch
+    from contextlib import contextmanager
+
+    class _RecorderRun:
+        def __init__(self):
+            self.run_id = "fake-id"
+            self.params: dict = {}
+            self.metrics_calls: list[tuple[dict, int | None]] = []
+        def log_params(self, p): self.params.update(p)
+        def log_metrics(self, m, step=None): self.metrics_calls.append((dict(m), step))
+        def log_metric(self, k, v, step=None): self.metrics_calls.append(({k: v}, step))
+        def set_tag(self, *a, **k): pass
+        def set_tags(self, *a, **k): pass
+        def log_artifact(self, *a, **k): pass
+
+    recorders: list[_RecorderRun] = []
+
+    @contextmanager
+    def _fake_run(*, enable=None, run_name=None, tags=None, nested=False):
+        r = _RecorderRun()
+        recorders.append(r)
+        yield r
+
+    with patch("src.pipelines.mlops_smoke_test.maybe_mlflow_run", _fake_run):
+        ids = _log_model_summary_runs(results=results, log_to_mlflow=True)
+
+    # One summary run per model (we only fed 'ridge', so one recorder)
+    assert len(recorders) == 1
+    assert ids == {"ridge": "fake-id"}
+    rec = recorders[0]
+
+    # Should have logged exactly 2 metric batches (v1 + v2, NOT v3)
+    assert len(rec.metrics_calls) == 2, rec.metrics_calls
+    steps = sorted(call[1] for call in rec.metrics_calls)
+    assert steps == [1, 2], f"expected step=1,2 for v1,v2; got {steps}"
+
+    # The skipped v3 must NOT have been logged
+    for _m, step in rec.metrics_calls:
+        assert step != 3, "v3 was skipped but appeared in summary stream"
+
+    # Both points carry the same metric keys → line chart will render
+    keys_per_step = [set(m.keys()) for m, _ in rec.metrics_calls]
+    assert keys_per_step[0] == keys_per_step[1] == {"mae", "rmse"}
+
+
+def test_log_model_summary_runs_noop_when_logging_disabled():
+    """When MLflow logging is off, no summary runs are emitted — the
+    feature is purely a UI helper, never load-bearing."""
+    from src.pipelines.mlops_smoke_test import _log_model_summary_runs
+
+    ids = _log_model_summary_runs(results=[], log_to_mlflow=False)
+    assert ids == {}
+
+
 def test_v5_rolling_validation_never_scores_target_beyond_cutoff(
     synthetic_panel: Path, tmp_path: Path,
 ):
