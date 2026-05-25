@@ -70,7 +70,14 @@ class _DeltaWrapped:
         return X.drop(columns=[OBSERVED_COL]) if OBSERVED_COL in X.columns else X
 
     # ---- fit / predict --------------------------------------------------
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "_DeltaWrapped":
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        *,
+        X_valid: pd.DataFrame | None = None,
+        y_valid: pd.Series | None = None,
+    ) -> "_DeltaWrapped":
         if OBSERVED_COL not in X.columns:
             raise KeyError(
                 f"Delta models require '{OBSERVED_COL}' in X. Run "
@@ -78,7 +85,32 @@ class _DeltaWrapped:
             )
         y_delta = pd.Series(self.delta_target(X, y), index=X.index, name="delta")
         feat_view = self._feature_view(X)
-        self.base.fit(feat_view, y_delta)
+
+        # Forward the validation set to the base model (necessary for
+        # LightGBM's per-iteration eval_history → MLflow learning curve).
+        # The delta wrapper transforms BOTH targets identically: the
+        # validation set's delta target = y_valid - X_valid[OBSERVED_COL].
+        base_fit_kwargs = {}
+        if X_valid is not None and y_valid is not None:
+            try:
+                import inspect
+                base_fit_params = inspect.signature(self.base.fit).parameters
+                if "X_valid" in base_fit_params and "y_valid" in base_fit_params:
+                    if OBSERVED_COL in X_valid.columns:
+                        y_valid_delta = pd.Series(
+                            self.delta_target(X_valid, y_valid),
+                            index=X_valid.index, name="delta",
+                        )
+                        feat_view_valid = self._feature_view(X_valid)
+                        base_fit_kwargs["X_valid"] = feat_view_valid
+                        base_fit_kwargs["y_valid"] = y_valid_delta
+            except Exception:
+                # Wrong introspection / shape errors fall through to a
+                # plain fit — the wrapper still works, just without the
+                # per-iteration curve for that fold.
+                base_fit_kwargs = {}
+
+        self.base.fit(feat_view, y_delta, **base_fit_kwargs)
         self.used_features = getattr(self.base, "used_features", list(feat_view.columns))
         return self
 

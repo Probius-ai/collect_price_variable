@@ -460,7 +460,7 @@ def test_v5_rolling_validation_never_scores_target_beyond_cutoff(
     df = pd.read_parquet(synthetic_panel)
     cutoff = pd.Timestamp("2025-08-01")
     horizon = 1
-    preds, _metrics = _evaluate_latest_rolling_validation(
+    preds, _metrics, _last_fold_model = _evaluate_latest_rolling_validation(
         PersistenceMonthly, df,
         target_col="target_smp_t_plus_h_months",
         data_cutoff_month=cutoff,

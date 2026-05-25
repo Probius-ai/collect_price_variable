@@ -336,10 +336,15 @@ def _extract_learning_curve(model: Any) -> dict[str, list[float]] | None:
             return {"train_loss": list(model.loss_curve_)}
         except Exception:
             pass
-    # Some wrappers (DeltaLightGBM etc.) hold the inner model
-    inner = getattr(model, "base_model", None) or getattr(model, "model", None)
-    if inner is not None and inner is not model:
-        return _extract_learning_curve(inner)
+    # Some wrappers hold the inner model under different attribute names:
+    #   `_DeltaWrapped.base`     — used by DeltaRidge / DeltaLightGBM / DeltaARRidge
+    #   `.base_model` / `.model` — legacy/alternate naming used by other wrappers
+    for inner_attr in ("base", "base_model", "model"):
+        inner = getattr(model, inner_attr, None)
+        if inner is not None and inner is not model:
+            recurse = _extract_learning_curve(inner)
+            if recurse is not None:
+                return recurse
 
     return None
 
@@ -384,6 +389,13 @@ def _evaluate_latest_rolling_validation(
     )
 
     rows: list[dict[str, Any]] = []
+    # Stash the last successful fold's model so the caller can pull a
+    # learning curve out of it (LightGBM eval_history is per-model, so
+    # we can only show ONE curve for the whole rolling sequence — pick
+    # the latest fold since it sees the most data).
+    last_fold_model: Any | None = None
+    import inspect
+
     for m in months:
         # Train: row's target must land strictly before this fold's eval
         train_mask = (target_month < m) & panel[target_col].notna()
@@ -396,17 +408,39 @@ def _evaluate_latest_rolling_validation(
         m_model = model_factory()
         X_train = _drop_leakage_columns(train, target_col)
         y_train = train[target_col].astype(float)
-        m_model.fit(X_train, y_train)
+
+        # Carve a small per-fold validation slice from the END of the
+        # training window so iterative models (LightGBM family) can:
+        #   * early-stop on it
+        #   * populate `eval_history` → per-iteration learning curve
+        # Strict leak-safety: this slice is BEFORE the eval row's
+        # target month (it's drawn from `train`, which already passed
+        # `target_month < m`). So the curve doesn't see the fold's
+        # actual eval label.
+        fit_kwargs: dict[str, Any] = {}
+        try:
+            if (
+                "X_valid" in inspect.signature(m_model.fit).parameters
+                and len(X_train) >= 10
+            ):
+                slice_n = max(3, len(X_train) // 7)  # ~15 %
+                fit_kwargs["X_valid"] = X_train.iloc[-slice_n:]
+                fit_kwargs["y_valid"] = y_train.iloc[-slice_n:]
+        except (TypeError, ValueError):
+            fit_kwargs = {}
+
+        m_model.fit(X_train, y_train, **fit_kwargs)
         X_eval = _drop_leakage_columns(eval_row, target_col)
         y_pred = pd.Series(m_model.predict(X_eval)).iloc[0]
         y_true = float(eval_row[target_col].iloc[0])
         rows.append({"period_month": m, "y_true": y_true, "y_pred": float(y_pred)})
+        last_fold_model = m_model
 
     preds = pd.DataFrame(rows)
     if preds.empty:
-        return preds, {}
+        return preds, {}, None
     metrics = compute_metrics(preds["y_true"], preds["y_pred"])
-    return preds, _metrics_to_dict(metrics)
+    return preds, _metrics_to_dict(metrics), last_fold_model
 
 
 def _metrics_to_dict(m: Any) -> dict[str, float]:
@@ -533,13 +567,18 @@ def _train_one(
             # rolling function itself filters training by
             # `period_month + horizon < m` per fold for strict leak-safety.
             window = int(version_cfg.get("rolling_window_months", 12))
-            preds, metrics = _evaluate_latest_rolling_validation(
+            preds, metrics, last_fold_model = _evaluate_latest_rolling_validation(
                 MODEL_FACTORIES[model_name], panel,
                 target_col=target_col,
                 data_cutoff_month=cutoff,
                 window_months=window,
                 horizon_months=horizon_months,
             )
+            # Replace the locally-fit `model` with the last fold's model
+            # so the downstream learning-curve extraction picks up the
+            # most-data-trained convergence series.
+            if last_fold_model is not None:
+                model = last_fold_model
             n_train, n_test = n_train_pool, len(preds)
         else:
             raise ValueError(f"Unknown evaluation_mode: {eval_mode!r}")
