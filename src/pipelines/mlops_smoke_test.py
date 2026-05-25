@@ -64,15 +64,31 @@ from src.tracking.mlflow_utils import (
 )
 from src.utils.logging import get_logger
 
-# Optional models — sklearn MLPRegressor isn't a project model but we
-# allow it via lng_forecast.models.MLPForecaster for completeness; if the
-# user has that dependency missing or the panel is too small we
-# controlled-skip and log the reason as an MLflow tag.
+# Iterative-training models for learning-curve visualisation in MLflow.
+# Each exposes an `eval_history` (or `loss_curve_`) attribute that the
+# smoke test extracts and logs as a stepped metric series.
+#
+# Soft imports — torch / xgboost are heavy optional deps. The factory
+# raises at call time when missing, which the per-(version, model) loop
+# converts to a controlled skip with a logged reason.
+try:
+    from src.models.iterative_models import (
+        MLPMonthlyModel,
+        XGBoostMonthlyModel,
+        TorchMLPModel,
+        TorchLSTMModel,
+    )
+    _HAS_ITERATIVE = True
+except Exception:
+    _HAS_ITERATIVE = False
+
+# Legacy LNG forecaster — kept around so older registry rows referencing
+# `mlp_lng` still resolve.
 try:
     from src.models.lng_forecast.models import MLPForecaster  # noqa: F401
-    _HAS_MLP = True
+    _HAS_LNG_MLP = True
 except Exception:
-    _HAS_MLP = False
+    _HAS_LNG_MLP = False
 
 
 log = get_logger("mlops_smoke_test")
@@ -123,11 +139,33 @@ def _make_delta_lightgbm():
 
 
 def _make_mlp():
-    # The neural baseline. Wired as a controlled-skip in practice — see
-    # MLPSkip handling in `_train_one`. The factory is here for symmetry.
-    if not _HAS_MLP:
-        raise RuntimeError("MLPForecaster not available in this environment")
-    return MLPForecaster()
+    """sklearn MLPRegressor with NaN imputation + scaling pipeline.
+
+    Replaces the prior MLPForecaster-on-monthly-panel path that crashed
+    with `Input X contains NaN` because the panel has sparse columns
+    (JKM lags from 2013+, settlement/capacity publication gaps).
+    """
+    if not _HAS_ITERATIVE:
+        raise RuntimeError("MLPMonthlyModel unavailable — check sklearn import")
+    return MLPMonthlyModel()
+
+
+def _make_xgboost():
+    if not _HAS_ITERATIVE:
+        raise RuntimeError("XGBoostMonthlyModel unavailable — `pip install xgboost`")
+    return XGBoostMonthlyModel()
+
+
+def _make_torch_mlp():
+    if not _HAS_ITERATIVE:
+        raise RuntimeError("TorchMLPModel unavailable — `pip install torch`")
+    return TorchMLPModel()
+
+
+def _make_torch_lstm():
+    if not _HAS_ITERATIVE:
+        raise RuntimeError("TorchLSTMModel unavailable — `pip install torch`")
+    return TorchLSTMModel()
 
 
 MODEL_FACTORIES: dict[str, Callable[[], Any]] = {
@@ -141,6 +179,9 @@ MODEL_FACTORIES: dict[str, Callable[[], Any]] = {
     "lightgbm":              _make_lightgbm,
     "delta_lightgbm":        _make_delta_lightgbm,
     "mlp":                   _make_mlp,
+    "xgboost":               _make_xgboost,
+    "torch_mlp":             _make_torch_mlp,
+    "torch_lstm":            _make_torch_lstm,
 }
 
 
@@ -308,37 +349,61 @@ def _evaluate_fixed_holdout(
 
 
 def _extract_learning_curve(model: Any) -> dict[str, list[float]] | None:
-    """Pull a per-iteration metric history out of a fitted model.
+    """Pull per-iteration metric histories out of a fitted model.
 
-    Returns ``{metric_name: [values_per_iter]}`` for models that have
-    such a history (LightGBM after fit-with-validation; sklearn MLP via
-    ``loss_curve_``). Returns ``None`` for models without an epoch
-    concept (Ridge, persistence, naive baselines) — those converge in
-    one shot and only have a final test metric, no curve to draw.
+    Returns a FLAT dict ``{metric_key: [values_per_iter]}`` so the
+    smoke test can log each series to MLflow under its own metric
+    name and the UI can overlay them across models.
 
-    The smoke test logs whatever this returns to the MLflow run as a
-    stepped metric series so the run's Metrics tab renders it as an
-    actual learning curve instead of a single point.
+    Key naming convention (so cross-model overlay works in MLflow's
+    Compare-runs view): each metric from the inner `eval_history`
+    dict is renamed `{metric_name}_{dataset_name}` — e.g.
+    `rmse_valid`, `rmse_train`, `r2_valid`. So when the user picks
+    `metric=rmse_valid` in Compare → all iterative models that had a
+    validation set are overlaid with one line per model.
+
+    Source mapping:
+      * LightGBM / XGBoost — `eval_history` dict from the boost callback
+      * Torch models (MLP / LSTM) — `eval_history` dict from the manual
+        training loop
+      * sklearn MLPRegressor — `loss_curve_` (training MSE → RMSE) +
+        optional `validation_scores_` (R² on internal early-stopping slice)
+      * Wrappers (`_DeltaWrapped`) — recurse into `.base` / `.base_model`
+        / `.model` until we find a model with one of the above
+    Returns ``None`` for closed-form models (Ridge etc.) so the smoke
+    test knows there's no curve to log.
     """
-    # LightGBM family — eval_history is populated by lgb.record_evaluation
     history = getattr(model, "eval_history", None)
     if isinstance(history, dict) and history:
-        # eval_history shape: {dataset_name: {metric_name: [vals]}}
-        # Prefer the 'valid' bucket; fall back to 'train' if no valid was passed.
-        for dataset_name in ("valid", "train"):
-            if dataset_name in history and history[dataset_name]:
-                return {k: list(v) for k, v in history[dataset_name].items()}
+        out: dict[str, list[float]] = {}
+        for dataset_name, metrics in history.items():
+            if not isinstance(metrics, dict):
+                continue
+            for metric_name, values in metrics.items():
+                try:
+                    out[f"{metric_name}_{dataset_name}"] = [float(v) for v in values]
+                except (TypeError, ValueError):
+                    continue
+        if out:
+            return out
 
     # sklearn MLPRegressor exposes loss_curve_ — fitted training loss
-    # per iteration. Not a holdout metric, but still a learning curve.
+    # per iteration. Reported as `rmse_train` (sqrt of MSE) for unit-
+    # consistency with the other iterative models.
     if hasattr(model, "loss_curve_"):
         try:
-            return {"train_loss": list(model.loss_curve_)}
+            import math
+            out: dict[str, list[float]] = {
+                "rmse_train": [math.sqrt(max(0.0, float(v))) for v in model.loss_curve_],
+            }
+            if (hasattr(model, "validation_scores_")
+                    and getattr(model, "validation_scores_")):
+                out["r2_valid"] = [float(v) for v in model.validation_scores_]
+            return out
         except Exception:
             pass
-    # Some wrappers hold the inner model under different attribute names:
-    #   `_DeltaWrapped.base`     — used by DeltaRidge / DeltaLightGBM / DeltaARRidge
-    #   `.base_model` / `.model` — legacy/alternate naming used by other wrappers
+
+    # Wrappers (DeltaLightGBM etc.) — recurse into the inner model
     for inner_attr in ("base", "base_model", "model"):
         inner = getattr(model, inner_attr, None)
         if inner is not None and inner is not model:

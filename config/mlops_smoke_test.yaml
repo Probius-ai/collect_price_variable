@@ -116,16 +116,28 @@ models:
     kind: tree
     min_train_rows: 48
 
-  # MLP is included as a controlled-skip example: monthly panel after
-  # filtering to v1 cutoff has < 132 rows, which is too small for a
-  # reliably-fitting MLP. We log the skip reason as an MLflow tag.
+  # MLP — sklearn MLPRegressor with SimpleImputer pipeline (the prior
+  # MLPForecaster crashed on NaN cols; the new MLPMonthlyModel handles
+  # them). Lowered min_train_rows from 132 so v1/v2 also fit, which is
+  # what gives the user 5 versions of learning-curve data to compare.
   - name: mlp
     kind: neural
-    min_train_rows: 132
-    skip_reason_if_underfit: |
-      Insufficient training rows for stable MLP fit.
-      Monthly panel only spans ~10 years; MLP needs ≥132 rows for the
-      default architecture to fit without overfitting noise.
+    min_train_rows: 60
+
+  # XGBoost — boosting iteration curve (analogous to LightGBM)
+  - name: xgboost
+    kind: tree
+    min_train_rows: 36
+
+  # PyTorch feed-forward MLP — full per-epoch loss tracking (train+valid)
+  - name: torch_mlp
+    kind: neural
+    min_train_rows: 60
+
+  # PyTorch LSTM over smp_lag_{1..12}m as a 12-step sequence
+  - name: torch_lstm
+    kind: neural
+    min_train_rows: 60
 
 # ---------------------------------------------------------------------------
 # Promotion policy
