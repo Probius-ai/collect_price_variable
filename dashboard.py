@@ -360,6 +360,7 @@ page = st.sidebar.radio(
         "7. LNG before/after",
         "8. LNG forecast (PDF-guided)",
         "9. Round 8-9 collectors",
+        "10. MLOps smoke test (v1-v5)",
     ],
 )
 
@@ -1238,6 +1239,189 @@ elif page == "9. Round 8-9 collectors":
             "weather_monthly_from_db.csv not found — "
             "run the solar_beam → monthly aggregation script."
         )
+
+
+# ---------------------------------------------------------------------------
+# Page 10: MLOps smoke test (v1..v5)
+# ---------------------------------------------------------------------------
+
+elif page == "10. MLOps smoke test (v1-v5)":
+    st.header("MLOps smoke test — v1..v5 staged retraining")
+    st.caption(
+        "Read-only view of the latest run of "
+        "`python -m src.pipelines.mlops_smoke_test`. Simulates retraining "
+        "as new data accumulates by truncating the feature panel to "
+        "successively-later `data_cutoff_month` values. v1..v4 score "
+        "against a forward holdout; v5 has no future labels and uses "
+        "rolling validation only — promotion to production is intentionally "
+        "left to a human operator."
+    )
+
+    MLOPS_REPORT_JSON = ROOT / "outputs/reports/mlops_smoke_test_v1_v5_report.json"
+    MLOPS_REPORT_MD = ROOT / "outputs/reports/mlops_smoke_test_v1_v5_report.md"
+    MLOPS_COMPARISON_CSV = ROOT / "outputs/metrics/mlops_version_comparison.csv"
+    MLOPS_REGISTRY_DIR = ROOT / "outputs/model_registry"
+
+    if not MLOPS_COMPARISON_CSV.exists():
+        st.warning(
+            "No MLOps smoke-test results yet. Run "
+            "`python -m src.pipelines.mlops_smoke_test "
+            "--config config/mlops_smoke_test.yaml` (add `--log-to-mlflow` "
+            "after `docker compose up -d` to also log to MLflow)."
+        )
+    else:
+        df = pd.read_csv(MLOPS_COMPARISON_CSV)
+        if "data_cutoff_month" in df.columns:
+            df["data_cutoff_month"] = pd.to_datetime(
+                df["data_cutoff_month"], errors="coerce"
+            )
+
+        # Topline metrics
+        n_versions = df["version"].nunique() if "version" in df.columns else 0
+        n_runs = len(df)
+        n_skipped = int(df["skipped"].sum()) if "skipped" in df.columns else 0
+        n_mlflow = (
+            int(df["mlflow_run_id"].notna().sum())
+            if "mlflow_run_id" in df.columns else 0
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Versions", n_versions)
+        c2.metric("Total (version, model) runs", n_runs)
+        c3.metric("Controlled-skips", n_skipped)
+        c4.metric("MLflow-logged runs", n_mlflow)
+
+        # ---- Version comparison table ------------------------------------
+        st.subheader("Comparison table — v1..v5 × models")
+        st.caption(
+            "`registry_status`: `historical_backtest` (v1..v4 fixed holdout), "
+            "`latest_candidate` (v5 rolling validation only), "
+            "`recommended_historical` (best v1..v4 by primary metric), "
+            "`skipped` (controlled-skip — see `skip_reason`). "
+            "No row is ever auto-promoted to production."
+        )
+        show_cols = [
+            c for c in [
+                "version", "model", "data_cutoff_month", "evaluation_mode",
+                "n_train", "n_test", "mae", "rmse", "mape", "r2",
+                "improvement_vs_persistence", "registry_status",
+                "mlflow_run_id", "skip_reason",
+            ] if c in df.columns
+        ]
+        st.dataframe(
+            df[show_cols].round(3),
+            width="stretch", hide_index=True,
+        )
+
+        # ---- Metric trend per version ------------------------------------
+        st.subheader("Metric trend across versions")
+        numeric_metrics = [
+            c for c in ["mae", "rmse", "mape", "r2", "directional_accuracy"]
+            if c in df.columns
+        ]
+        if numeric_metrics:
+            metric = st.selectbox(
+                "Metric", numeric_metrics, index=0,
+                help="Plot this metric per model across v1..v5."
+            )
+            # Mark v5 visually so the "no future holdout" caveat is obvious
+            chart_df = df[["version", "model", metric, "evaluation_mode"]].copy()
+            chart_df = chart_df.dropna(subset=[metric])
+            fig = px.line(
+                chart_df.sort_values(["model", "version"]),
+                x="version", y=metric, color="model",
+                line_dash="evaluation_mode",
+                markers=True,
+                title=f"{metric} by version (dashed = rolling-validation only)",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+        # ---- Registry status snapshot ------------------------------------
+        st.subheader("Model registry status")
+        if "registry_status" in df.columns:
+            status_counts = (
+                df.groupby(["version", "registry_status"])
+                .size().reset_index(name="count")
+            )
+            fig = px.bar(
+                status_counts,
+                x="version", y="count", color="registry_status",
+                barmode="stack",
+                title="Promotion status per version",
+                category_orders={
+                    "registry_status": [
+                        "recommended_historical",
+                        "historical_backtest",
+                        "latest_candidate",
+                        "skipped",
+                    ],
+                },
+            )
+            st.plotly_chart(fig, width="stretch")
+
+            # Surface the recommendation explicitly
+            rec = df[df["registry_status"] == "recommended_historical"]
+            if not rec.empty:
+                r = rec.iloc[0]
+                st.success(
+                    f"**Recommended historical model**: `{r['model']}` "
+                    f"from `{r['version']}` (cutoff "
+                    f"{pd.Timestamp(r['data_cutoff_month']):%Y-%m}) — "
+                    f"MAE {r['mae']:.3f}. Promotion to production is manual."
+                )
+            latest = df[df["registry_status"] == "latest_candidate"]
+            if not latest.empty:
+                st.info(
+                    f"**Latest candidate**: {len(latest)} model(s) trained at "
+                    f"cutoff `{pd.Timestamp(latest.iloc[0]['data_cutoff_month']):%Y-%m}`. "
+                    "v5 has **no future labels** — scores come from rolling "
+                    "validation against the last 12 months of its own training "
+                    "window, NOT a forward holdout."
+                )
+
+        # ---- Per-model registry history (JSON fallback) ------------------
+        if MLOPS_REGISTRY_DIR.exists():
+            registry_files = sorted(MLOPS_REGISTRY_DIR.glob("*_registry.json"))
+            if registry_files:
+                st.subheader("JSON registry (per-model history)")
+                st.caption(
+                    "The smoke test always writes a JSON registry under "
+                    "`outputs/model_registry/<model>_registry.json` in "
+                    "addition to MLflow, so version history survives even "
+                    "if the MLflow backend is down."
+                )
+                sel_model = st.selectbox(
+                    "Model registry to inspect",
+                    [p.stem.removesuffix("_registry") for p in registry_files],
+                )
+                sel_path = MLOPS_REGISTRY_DIR / f"{sel_model}_registry.json"
+                if sel_path.exists():
+                    records = json.loads(sel_path.read_text(encoding="utf-8")).get(
+                        "records", [])
+                    if records:
+                        rdf = pd.DataFrame([
+                            {
+                                "version": r["version"],
+                                "cutoff": r["data_cutoff_month"],
+                                "mode": r["evaluation_mode"],
+                                "promotion": r["promotion_status"],
+                                "mae": (r.get("metrics") or {}).get("mae"),
+                                "rmse": (r.get("metrics") or {}).get("rmse"),
+                                "mlflow_run_id": r.get("mlflow_run_id"),
+                                "n_train": r.get("n_train"),
+                                "n_test": r.get("n_test"),
+                                "created_at": r.get("created_at"),
+                            }
+                            for r in records
+                        ])
+                        st.dataframe(
+                            rdf.round(3),
+                            width="stretch", hide_index=True,
+                        )
+
+        # ---- Raw markdown report (collapsed) -----------------------------
+        if MLOPS_REPORT_MD.exists():
+            with st.expander("Full markdown report"):
+                st.markdown(MLOPS_REPORT_MD.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------

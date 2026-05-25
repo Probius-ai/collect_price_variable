@@ -390,6 +390,119 @@ Per Plan.md §9 and the user brief:
 * SARIMAX / XGBoost / TFT (post-MVP per Plan.md §9.7).
 * Walk-forward CV — current splits are single chronological train/valid/test.
 
+## MLOps — MLflow tracking + v1..v5 retraining smoke test
+
+The repo ships a Docker-Compose MLOps stack (MLflow Tracking Server +
+Postgres backend) plus a staged-retraining smoke test that simulates
+five rounds of "new data arrived → retrain → record". Designed for the
+MLOps course demo: every model run lands in the MLflow UI AND in a JSON
+registry fallback under `outputs/model_registry/`.
+
+### Stack overview
+
+* `docker-compose.yml` — Postgres 16 (host port `5433`) + MLflow Tracking
+  Server (host port `5000`, `--serve-artifacts`, artifacts persisted on
+  host under `./artifacts/mlflow`). Built from the project `Dockerfile`
+  so the MLflow container has all project deps too.
+* `src/tracking/mlflow_utils.py` — `maybe_mlflow_run()` context
+  manager (no-op when disabled, fails loud when enabled but unreachable),
+  plus the JSON registry fallback (`RegistryRecord` + `append_registry_record`).
+* `src/pipelines/mlops_smoke_test.py` — v1..v5 orchestrator.
+* `config/mlops_smoke_test.yaml` — version + model definitions.
+
+### Start the stack
+
+```bash
+# 1. Boot Postgres + MLflow (port 5000 = MLflow UI, 5433 = Postgres on host).
+docker compose up -d
+
+# 2. Open the MLflow UI
+xdg-open http://localhost:5000  # or just visit it in a browser
+```
+
+### Run the smoke test
+
+The smoke test simulates retraining at five cutoff months
+(2021-12 / 2022-12 / 2023-12 / 2024-12 / 2025-08). v1..v4 score against
+a forward holdout; v5 has no future labels and falls back to rolling
+validation against the last 12 months of its own training window.
+
+```bash
+# Local Python (uses your venv). No MLflow logging — registry JSON only.
+python -m src.pipelines.mlops_smoke_test --config config/mlops_smoke_test.yaml
+
+# Same, but with MLflow tracking enabled (server must be up).
+python -m src.pipelines.mlops_smoke_test \
+    --config config/mlops_smoke_test.yaml \
+    --log-to-mlflow
+
+# Subset for faster iteration during dev
+python -m src.pipelines.mlops_smoke_test \
+    --config config/mlops_smoke_test.yaml \
+    --only-versions v1,v2 \
+    --only-models persistence_monthly,ridge
+
+# Via the project container (uses MLFLOW_TRACKING_URI=http://mlflow:5000
+# inside the compose network; ENABLE_MLFLOW=true is baked in)
+docker compose run --rm app python -m src.pipelines.mlops_smoke_test \
+    --config config/mlops_smoke_test.yaml --log-to-mlflow
+```
+
+### Outputs
+
+Every run regenerates these (all gitignored):
+
+| Path | What |
+| --- | --- |
+| `outputs/mlops_smoke_test/<vN>/<model>/predictions.csv` | Per-(version, model) predictions |
+| `outputs/mlops_smoke_test/<vN>/<model>/metrics.json` | MAE/RMSE/MAPE/R²/directional |
+| `outputs/mlops_smoke_test/<vN>/<model>/model.pkl` | Pickled fit (some models skip — see warnings) |
+| `outputs/mlops_smoke_test/<vN>/<model>/run_summary.json` | Mirror of MLflow params+metrics+tags |
+| `outputs/model_registry/<model_name>_registry.json` | Per-model version history (works without MLflow) |
+| `outputs/reports/mlops_smoke_test_v1_v5_report.md` | Human-readable summary |
+| `outputs/reports/mlops_smoke_test_v1_v5_report.json` | Dashboard-friendly JSON |
+| `outputs/metrics/mlops_version_comparison.csv` | Flat (version, model) table |
+
+### Promotion policy
+
+The smoke test never auto-promotes to production. Each row is tagged:
+
+* `historical_backtest`   — v1..v4 fixed-holdout runs
+* `latest_candidate`      — v5 rolling-validation runs
+* `recommended_historical` — best v1..v4 by MAE (one row, across all models)
+* `skipped`               — controlled-skip (insufficient data, model error)
+
+Tag a model as production via the MLflow UI manually, or extend
+`outputs/model_registry/*_registry.json` with your own promotion record.
+
+### Dashboard
+
+Streamlit Page 10 (**"MLOps smoke test (v1-v5)"**) renders the
+comparison CSV + registry JSON, with a per-metric trend chart and a
+promotion-status breakdown per version. Start the dashboard
+(`streamlit run dashboard.py`) and pick the page from the sidebar.
+
+### Architecture notes
+
+* MLflow logging is **optional** — every pipeline supports both modes:
+    * `--log-to-mlflow` flag, OR `ENABLE_MLFLOW=true` env var → live run.
+    * Neither set → no-op log calls, JSON registry still written.
+* Server unreachable + logging requested → **fail loud** (not silent).
+* `filter_to_cutoff()` is the load-bearing leak-safety helper for
+  training data. Test sets pull from the FULL panel since labels become
+  observable in retrospect even if they wouldn't be at the simulated
+  retraining moment.
+* v5 deliberately uses rolling validation — no future-month labels are
+  fabricated. Promotion language reflects this ("latest_candidate",
+  not "fixed_holdout").
+
+### Out of scope (intentionally)
+
+Per the spec: no cron retraining, no file-arrival watcher, no
+Kubernetes/AWS, no automatic production promotion, no copying/deleting
+raw files to simulate data arrival. The "staged retraining" is a
+filter-based simulation, not a real-data pipeline.
+
 ## License
 
 MIT.
