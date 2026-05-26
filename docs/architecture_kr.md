@@ -483,13 +483,45 @@ docker compose up -d                        # mlflow :5000
 
 ## 12. 의존성
 
-**Python (Python 3.14, pyproject.toml + requirements.txt):**
-- 데이터: pandas 2.x, numpy, pyarrow
-- 모델: scikit-learn 1.8, lightgbm, xgboost 3.2, torch 2.12 (+cu130 wheel)
-- API/UI: fastapi, uvicorn, streamlit, plotly, matplotlib
-- 추적/저장: mlflow 3.12, duckdb, sqlalchemy, psycopg2
-- 수집: requests, tenacity, lxml, openpyxl
-- 설정: pydantic-settings, typer, pyyaml
+**Python 인터프리터:** `requires-python = ">=3.10"` (pyproject.toml).
+개발 환경 런타임은 3.14.4 (`.venv/`). 실배포는 Docker 이미지가 핀하는 것을 따른다 —
+3.10/3.11/3.12 어느 쪽으로 빌드해도 호환되어야 한다.
+
+**Python 패키지 핀** (`requirements.txt` + `pyproject.toml` 동기, 2026-05-26 기준):
+
+| 카테고리 | 패키지 | 핀 | 비고 |
+|----------|--------|-----|------|
+| 데이터 | pandas | `>=2.1` | 2.x 시리즈 (round 6 `pct_change(fill_method=None)` 의존) |
+| | numpy | `>=1.26` | |
+| | pyarrow | (transitively pulled by pandas) | parquet I/O |
+| 모델 — 클래식 | scikit-learn | `>=1.4` | MLPRegressor, Ridge, SimpleImputer, StandardScaler |
+| 모델 — boosting | lightgbm | `>=4.3` | `record_evaluation` 콜백 사용 |
+| | xgboost | `>=3.0,<4.0` | round 9 `iterative_models.py` 필수 |
+| 모델 — neural | torch | `>=2.5,<3.0` | CPU 사용 (`device="cpu"`); 기본 PyPI는 CUDA wheels ~2 GB 동반 |
+| 추적/저장 | mlflow | `>=3.0,<4.0` | UI Compare-runs Chart view 의존 |
+| | duckdb | `>=0.10` | |
+| | psycopg2-binary | `>=2.9` | MLflow postgres backend store |
+| API/UI | fastapi | `>=0.110` | `api/main.py` |
+| | uvicorn | `>=0.27` | dev server `--reload` |
+| | streamlit | `>=1.57,<2.0` | `width="stretch"` 일관성 |
+| | plotly | `>=6.0,<7.0` | dashboard overlay 차트 |
+| | matplotlib | `>=3.8,<4.0` | snapshot PNG + MLflow overlay artifact |
+| 수집 | requests | `>=2.31` | tenacity 재시도와 함께 |
+| | tenacity | `>=8.2` | API collector retry |
+| | xmltodict | `>=0.13` | KPX XML 파싱 |
+| | (lxml/openpyxl) | (transitively) | xlsx/xml loader 의존 |
+| 설정 | pydantic | `>=2.6` | |
+| | pydantic-settings | `>=2.2` | `.env` 로딩 |
+| | typer | `>=0.12` | CLI 진입점 |
+| | PyYAML | `>=6.0` | `mlops_smoke_test.yaml` 파싱 |
+| | python-dotenv | `>=1.0` | |
+| | rich | `>=13.7` | typer 출력 |
+
+**Optional 그룹** (pyproject `[project.optional-dependencies]`):
+- `dev` — pytest, pytest-cov
+- `postgres` — psycopg[binary] (psycopg3, MLflow 외 용도)
+- `extra-models` — statsmodels (홀가분한 시계열 baseline 추가용)
+- `polars` — polars (실험적 대용량 처리)
 
 **Node (web/):** Next.js 15 / React 19 / Tailwind CSS.
 
@@ -498,6 +530,12 @@ docker compose up -d                        # mlflow :5000
 **외부 sister projects** (gitignored, 참조용 — [`external_models_inventory.md`](external_models_inventory.md)):
 - `solar/` — LNG 가격 예측 외부 모델
 - `solar_beam/` — 태양광 발전량 예측 + `raw_weather` 시간별 DB
+
+> **버전 동기화 책임:** 새 dep 추가 시 `requirements.txt` + `pyproject.toml`을 함께 수정.
+> 본 표는 두 파일에서 파생되며, drift가 발생하면 (예: 설치된 mlflow 3.x ↔ 핀 `<3.0`) 본 표 갱신이 늦어진 것이 아니라 핀 자체 갱신이 늦은 것이 원인. 최신 설치 버전 확인:
+> ```bash
+> .venv/bin/pip list --format=freeze | grep -iE 'mlflow|xgboost|torch|sklearn|pandas'
+> ```
 
 ---
 

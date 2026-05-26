@@ -48,5 +48,20 @@ plotly>=6.0,<7.0
 # store; pinning it here means `pip install -r requirements.txt` inside
 # the project Docker image (see `Dockerfile`) gives a working tracking
 # server out of the box.
-mlflow>=2.13,<3.0
+#
+# Pinned to 3.x because the dashboard + smoke-test rely on MLflow 3
+# features (Compare-runs Chart view + stepped metric overlays). The
+# prior <3.0 cap was unintentional drift — the running stack has been
+# on 3.x for the whole session.
+mlflow>=3.0,<4.0
 psycopg2-binary>=2.9
+
+# Iterative-training models exposed in src/models/iterative_models.py
+# (xgboost, torch_mlp, torch_lstm). Previously in `extra-models` optional
+# group, but they're now in the default MODEL_FACTORIES so the smoke
+# test fails ("xgboost not available") without them. Promoted to base.
+# torch comes from the default PyPI index by default (≈2 GB CUDA wheels);
+# operators on a footprint budget can re-install via the CPU-only index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+xgboost>=3.0,<4.0
+torch>=2.5,<3.0
