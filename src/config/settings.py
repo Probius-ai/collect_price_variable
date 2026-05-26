@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")
     project_timezone: str = Field(default="Asia/Seoul")
 
+    # Optional notification webhook for the MLOps smoke test. None / empty
+    # → the integration silently no-ops. Treat as a secret (anyone with
+    # the URL can post to the Discord channel).
+    mlops_discord_webhook_url: str | None = Field(default=None)
+
     @property
     def project_root(self) -> Path:
         return PROJECT_ROOT

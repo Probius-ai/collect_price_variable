@@ -1221,6 +1221,9 @@ def run_smoke_test(
     only_versions: list[str] | None = None,
     only_models: list[str] | None = None,
 ) -> pd.DataFrame:
+    import time
+    from src.utils.discord import discord_enabled, send_discord_message
+
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     target_cfg = cfg["target"]
     feature_table_path = target_cfg["feature_table"]
@@ -1235,21 +1238,80 @@ def run_smoke_test(
     if only_models:
         models = [m for m in models if m["name"] in set(only_models)]
 
+    # Discord notify: start. Wrapped in try so a webhook failure can't
+    # block training. discord_enabled() short-circuits when no URL set.
+    started_at = time.time()
+    n_runs_expected = len(versions) * len(models)
+    if discord_enabled():
+        send_discord_message(
+            embeds=[{
+                "title": "🚀 MLOps smoke test started",
+                "description": (
+                    f"**{len(versions)} versions** × **{len(models)} models** "
+                    f"= {n_runs_expected} runs\n"
+                    f"`{config_path.name}` → MLflow: "
+                    f"{'✅ enabled' if log_to_mlflow else '⚪ disabled'}"
+                ),
+                "color": 0x3b82f6,
+                "fields": [
+                    {"name": "versions", "value": ", ".join(v["name"] for v in versions), "inline": True},
+                    {"name": "models", "value": ", ".join(m["name"] for m in models)[:1024], "inline": False},
+                ],
+            }]
+        )
+
     artifact_root = Path(cfg["outputs"]["artifact_root"])
     results: list[VersionResult] = []
-    for v in versions:
-        # Inherit area from target if not version-specific
-        v.setdefault("area", target_cfg.get("area", "mainland"))
-        for m in models:
-            log.info("=== version=%s model=%s ===", v["name"], m["name"])
-            result = _train_one(
-                version_cfg=v, model_cfg=m, panel=panel,
-                target_col=target_col, log_to_mlflow=log_to_mlflow,
-                artifact_root=artifact_root,
-                feature_table_path=feature_table_path,
-                horizon_months=horizon_months,
+    try:
+        for v in versions:
+            # Inherit area from target if not version-specific
+            v.setdefault("area", target_cfg.get("area", "mainland"))
+            for m in models:
+                log.info("=== version=%s model=%s ===", v["name"], m["name"])
+                result = _train_one(
+                    version_cfg=v, model_cfg=m, panel=panel,
+                    target_col=target_col, log_to_mlflow=log_to_mlflow,
+                    artifact_root=artifact_root,
+                    feature_table_path=feature_table_path,
+                    horizon_months=horizon_months,
+                )
+                results.append(result)
+            # End-of-version Discord ping with quick top-3 by primary metric
+            if discord_enabled():
+                primary = cfg["promotion"]["primary_metric"]
+                version_results = [r for r in results if r.version == v["name"]]
+                ranked = sorted(
+                    [r for r in version_results if r.metrics and primary in r.metrics],
+                    key=lambda x: x.metrics[primary],
+                )
+                top3 = "\n".join(
+                    f"  {i + 1}. `{r.model_name}` — {primary}={r.metrics[primary]:.3f}"
+                    for i, r in enumerate(ranked[:3])
+                )
+                send_discord_message(
+                    embeds=[{
+                        "title": f"✅ {v['name']} complete",
+                        "description": (
+                            f"{len(version_results)} runs · "
+                            f"{sum(1 for r in version_results if r.skipped)} skipped\n"
+                            f"**Top by {primary}:**\n{top3 or '(no scored runs)'}"
+                        ),
+                        "color": 0x10b981,
+                    }]
+                )
+    except Exception as exc:
+        if discord_enabled():
+            send_discord_message(
+                embeds=[{
+                    "title": "❌ MLOps smoke test FAILED",
+                    "description": (
+                        f"After **{len(results)}/{n_runs_expected}** runs.\n"
+                        f"`{type(exc).__name__}`: {str(exc)[:500]}"
+                    ),
+                    "color": 0xef4444,
+                }]
             )
-            results.append(result)
+        raise
 
     # Two summary layers on top of the 35 individual (version, model) runs:
     #   1. PER-MODEL — one run per model with clean metric names (`mae`,
@@ -1277,6 +1339,31 @@ def run_smoke_test(
         report_json=Path(cfg["outputs"]["report_json"]),
         comparison_csv=Path(cfg["outputs"]["comparison_csv"]),
     )
+
+    # Final Discord ping — overall summary + top model across all versions
+    if discord_enabled():
+        elapsed = time.time() - started_at
+        primary = cfg["promotion"]["primary_metric"]
+        latest_ver = cfg["promotion"]["latest_version"]
+        latest_rows = df[df["version"] == latest_ver].sort_values(primary)
+        winner_block = "(no scored rows)"
+        if not latest_rows.empty:
+            top = latest_rows.iloc[0]
+            winner_block = (
+                f"**{latest_ver} winner:** `{top['model']}` — "
+                f"{primary}={top[primary]:.3f}"
+            )
+        n_skipped = int((df.get("skipped", False) == True).sum()) if "skipped" in df.columns else 0
+        send_discord_message(
+            embeds=[{
+                "title": "🎉 MLOps smoke test complete",
+                "description": (
+                    f"{len(df)} (version, model) rows in {elapsed / 60:.1f} min\n"
+                    f"Skipped: {n_skipped}\n\n{winner_block}"
+                ),
+                "color": 0x8b5cf6,
+            }]
+        )
     return df
 
 
