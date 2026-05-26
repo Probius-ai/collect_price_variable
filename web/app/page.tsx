@@ -106,14 +106,31 @@ export default async function HomePage() {
       {hourly && (
         <section className="space-y-3">
           <h2 className="text-xl font-semibold">
-            시간대별 가격대 (태양광 capacity factor 기반)
+            시간대별 가격대 (태양광 CF × 월간 SMP)
           </h2>
-          <p className="text-sm text-slate-600">
-            위에서 선정된 모델의 <strong>다음 달 평균 SMP</strong>를 daily mean으로
-            두고, 태양광 발전 CF가 LNG 화력 호출량을 좌우한다는 dispatch 가정
-            하에 24시간 가격을 산정합니다. 정오 = 태양광 피크 = SMP 저점,
-            저녁 17-21h = 태양광 collapse + 수요 피크 = SMP 최대.
-          </p>
+          <div className="rounded-md border border-sky-200 bg-sky-50 p-4 text-sm text-sky-900">
+            <p className="font-semibold">
+              📌 갱신 주기 ─ 두 신호는 별도로 움직입니다
+            </p>
+            <ul className="mt-2 list-disc space-y-1 pl-5 leading-relaxed">
+              <li>
+                <strong>월간 SMP 예측 (108.15 원/kWh)</strong> — 매월 새 데이터가
+                입력되면 재학습. 본 페이지의 <em>일평균</em> 기준선이며,
+                같은 달 안에서는 값이 바뀌지 않습니다.
+              </li>
+              <li>
+                <strong>시간별 태양광 발전 예측 (CF)</strong> —{" "}
+                <em>매 1시간마다</em> 단기 날씨 API를 호출해 갱신. 이 값이
+                LNG 화력 호출량을 결정하므로, 같은 일평균 SMP라도 시간대별
+                가격 분포가 달라집니다.
+              </li>
+            </ul>
+            <p className="mt-2 text-xs opacity-80">
+              따라서 위 차트의 <strong>bar 높이 (SMP)</strong>는 월간 모델이
+              결정한 daily-mean에 <strong>line (Solar CF)</strong> 의 시간 패턴을
+              곱한 값입니다.
+            </p>
+          </div>
           <HourlyChart data={hourly} />
         </section>
       )}

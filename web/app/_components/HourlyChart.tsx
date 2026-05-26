@@ -149,6 +149,13 @@ export function HourlyChart({ data }: { data: HourlyForecastResponse }) {
       <div className="rounded-md border border-slate-200 bg-slate-50 p-4 text-xs leading-relaxed text-slate-600">
         <p className="mb-1 font-semibold text-slate-800">산정 방식</p>
         <p>{data.methodology}</p>
+        <p className="mt-2 text-slate-700">
+          📡 <strong>Solar CF</strong>는 KMA 단기예보(/getVilageFcst) +
+          ASOS 일사량을 1시간마다 받아 재계산되는 동적 신호이고,
+          <strong> 월간 SMP daily mean</strong>은 한 달에 한 번만 갱신되는
+          정적 anchor입니다. 따라서 같은 날 안에서도 weather 업데이트가
+          오면 시간별 가격대는 매시간 새로 그려집니다 (월간 평균은 그대로).
+        </p>
         <p className="mt-2 text-amber-700">⚠️ {data.caveat}</p>
       </div>
     </div>

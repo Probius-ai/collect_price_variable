@@ -27,6 +27,12 @@ export function PriceHero({ forecast }: { forecast: ForecastResponse | null }) {
           <p className="text-sm font-medium uppercase tracking-wider text-blue-700">
             선정 모델의 출력 — 다음 달 평균 SMP
           </p>
+          <p className="mt-1 text-xs text-slate-500">
+            <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
+              📅 한 달에 한 번만 갱신
+            </span>{" "}
+            · 같은 달 동안은 이 값이 일평균 기준선으로 고정됩니다.
+          </p>
           <p className="mt-2 font-mono text-xs text-slate-500">
             target_month: {forecast.target_month} · forecast_origin:{" "}
             {forecast.forecast_origin_month}
