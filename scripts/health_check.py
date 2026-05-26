@@ -27,18 +27,50 @@ import urllib.request
 
 
 # Endpoints to probe. Add more as services come online.
+#
+# This repo's FastAPI app (`api/main.py`) exposes `/api/health`. The
+# server binds to 127.0.0.1 only (NOT 0.0.0.0), so the loopback IP
+# is intentional — `localhost` would also work but 127.0.0.1 is more
+# portable across DNS-resolver quirks on WSL2.
 TARGETS = [
-    "http://localhost:8000/health",
+    "http://127.0.0.1:8000/api/health",
 ]
 TIMEOUT = 5  # seconds — per request
-# When set, also verify the response JSON has `{"status": EXPECT_STATUS}`.
-# `None` → just check HTTP 200.
-EXPECT_STATUS = "ok"
+# `None` → just check HTTP 200 (no body validation).
+# Otherwise check the JSON body matches ANY of these "healthy" shapes:
+#   * `{"status": "ok"}`             — common convention #1
+#   * `{"ok": true}`                 — this repo's `api/main.py` convention
+#   * `{"healthy": true}`            — common convention #2
+#   * `{"health": "ok"|"healthy"}`   — common convention #3
+EXPECT_HEALTHY = True
 
 
 # Repo's `.env` provides this via `scripts/health_check_wrapper.sh`.
 # Empty / unset → no Discord push (stdout + exit code still work).
 DISCORD_WEBHOOK_URL = os.environ.get("HEALTH_CHECK_DISCORD_WEBHOOK_URL", "").strip()
+
+
+def _body_is_healthy(body: str) -> bool:
+    """Match any of the common "healthy" JSON shapes used by FastAPI
+    apps. Returns True for non-JSON bodies (only the HTTP 200 status
+    is then load-bearing) so the integration is forgiving when an
+    endpoint returns a plain "OK" string."""
+    try:
+        d = json.loads(body)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(d, dict):
+        return True
+    # Any of these "healthy" markers — fail only when ALL are explicitly false/bad
+    if d.get("ok") is True:
+        return True
+    if d.get("healthy") is True:
+        return True
+    if d.get("status") in ("ok", "healthy", "up"):
+        return True
+    if d.get("health") in ("ok", "healthy", "up"):
+        return True
+    return False
 
 
 def check(url: str) -> dict:
@@ -49,14 +81,8 @@ def check(url: str) -> dict:
             latency = round((time.perf_counter() - start) * 1000, 1)
             body = resp.read().decode("utf-8", "ignore")
             ok = resp.status == 200
-            if ok and EXPECT_STATUS:
-                # Tolerate non-JSON bodies — we only fail when the body
-                # IS valid JSON but the status field doesn't match.
-                try:
-                    if json.loads(body).get("status") != EXPECT_STATUS:
-                        ok = False
-                except json.JSONDecodeError:
-                    pass
+            if ok and EXPECT_HEALTHY:
+                ok = _body_is_healthy(body)
             return {"url": url, "ok": ok, "status": resp.status, "latency_ms": latency}
     except urllib.error.HTTPError as e:
         return {"url": url, "ok": False, "status": e.code, "error": "HTTPError"}
