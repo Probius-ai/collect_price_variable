@@ -2,6 +2,14 @@ pandas>=2.1
 numpy>=1.26
 scikit-learn>=1.4
 lightgbm>=4.3
+# pandas `read_excel(.xlsx)` engine — used by:
+#   src/pipelines/discover_file.py, src/collectors/kpx_files.py (Excel
+#   loaders for KPX HOME files), and the KMA grid (nx,ny) mapping at
+#   data/raw/manual_or_filedata/kma_grid_xy_mapping_file/.
+# Pandas declares this as an OPTIONAL dep ("Missing optional dependency
+# 'openpyxl'"), but it's load-bearing here — fresh `pip install -r
+# requirements.txt` without it breaks every Excel-format file loader.
+openpyxl>=3.1
 pydantic>=2.6
 pydantic-settings>=2.2
 python-dotenv>=1.0

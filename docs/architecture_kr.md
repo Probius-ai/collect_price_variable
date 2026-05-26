@@ -509,7 +509,8 @@ docker compose up -d                        # mlflow :5000
 | 수집 | requests | `>=2.31` | tenacity 재시도와 함께 |
 | | tenacity | `>=8.2` | API collector retry |
 | | xmltodict | `>=0.13` | KPX XML 파싱 |
-| | (lxml/openpyxl) | (transitively) | xlsx/xml loader 의존 |
+| | **openpyxl** | `>=3.1` | pandas `read_excel(.xlsx)` 엔진 — KMA 그리드 + KPX HOME loaders가 필수 의존. pandas는 *optional*로 분류하지만 우리 환경엔 load-bearing |
+| | (lxml) | (transitively) | xml loader |
 | 설정 | pydantic | `>=2.6` | |
 | | pydantic-settings | `>=2.2` | `.env` 로딩 |
 | | typer | `>=0.12` | CLI 진입점 |
