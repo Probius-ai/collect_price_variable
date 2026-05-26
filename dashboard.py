@@ -29,10 +29,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.models.registry import (
-    BASELINE_MODELS,
     DEFAULT_DASHBOARD_MODEL,
     STRONG_MONTHLY_BASELINE,
-    TRAINABLE_MODELS,
     classify,
 )
 from src.utils.io import source_root_dir
@@ -391,7 +389,8 @@ def _retrain_pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
     try:
-        import os, errno
+        import os
+        import errno
         os.kill(pid, 0)
         return True
     except (ProcessLookupError, PermissionError):
@@ -466,7 +465,9 @@ def _trigger_force_retrain() -> dict:
         Windows equivalent but isn't needed for this project's WSL
         target).
     """
-    import os, subprocess, sys
+    import os
+    import subprocess
+    import sys
     from datetime import datetime, timezone
 
     config_path, log_path = _force_retrain_preflight()

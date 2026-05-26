@@ -21,7 +21,7 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlencode
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests

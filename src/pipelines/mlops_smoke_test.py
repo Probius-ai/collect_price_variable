@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import pickle
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -58,7 +58,6 @@ from src.models.ridge_model import RidgeModel
 from src.tracking.mlflow_utils import (
     RegistryRecord,
     append_registry_record,
-    load_registry,
     maybe_mlflow_run,
     write_run_summary,
 )
@@ -1353,7 +1352,7 @@ def run_smoke_test(
                 f"**{latest_ver} winner:** `{top['model']}` — "
                 f"{primary}={top[primary]:.3f}"
             )
-        n_skipped = int((df.get("skipped", False) == True).sum()) if "skipped" in df.columns else 0
+        n_skipped = int(df["skipped"].astype(bool).sum()) if "skipped" in df.columns else 0
         send_discord_message(
             embeds=[{
                 "title": "🎉 MLOps smoke test complete",

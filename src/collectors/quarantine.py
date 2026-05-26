@@ -14,12 +14,10 @@ import json
 import shutil
 import unicodedata
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 from typing import Iterable
 
 from src.config.settings import get_settings, get_source_config
-from src.utils.io import manual_drop_dir
 from src.utils.logging import get_logger
 from src.utils.time import collected_now_utc
 

@@ -16,7 +16,6 @@ The series IDs we care about (set in sources.yaml::sources::eia_steo):
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import pandas as pd

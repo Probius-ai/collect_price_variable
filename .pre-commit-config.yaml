@@ -1,0 +1,31 @@
+# Pre-commit hooks — run locally before each `git commit`.
+#
+# Install once:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Same checks as CI (.github/workflows/lint.yml), so a clean local run
+# means CI lint will pass too. Tests are NOT in here — they're heavier
+# and run in CI only.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]   # block accidental data dumps / model pickles
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      # `ruff-format` is provided by the same hook repo; non-blocking
+      # initially so existing tree doesn't need a one-shot reformat.
+      - id: ruff-format

@@ -7,7 +7,6 @@ sources.yaml entries get verified.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Optional
 
 import typer
 

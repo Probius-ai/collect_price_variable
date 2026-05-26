@@ -46,7 +46,7 @@ def test_ts_folds_embargo_zero_keeps_train_tail_adjacent_to_valid():
     """Sanity: embargo=0 makes train_max == valid_min - 1 (no gap)."""
     for tr, va in ts_folds(80, n_splits=4, embargo=0):
         assert tr.max() + 1 == va.min(), (
-            f"embargo=0 should make train tail adjacent to valid head"
+            "embargo=0 should make train tail adjacent to valid head"
         )
 
 
@@ -135,7 +135,6 @@ def test_build_features_target_is_horizon_months_ahead(tmp_path, monkeypatch):
         # raw series we just stored.
         expected_target_month = row_month + pd.DateOffset(months=1)
         # Look up expected value from the synthetic LNG series.
-        expected_idx = (expected_target_month - months[0]).days // 30  # rough
         expected_value = np.linspace(10, 50, 36)[
             int(np.round((expected_target_month - months[0]).days / 30.4375))
         ]

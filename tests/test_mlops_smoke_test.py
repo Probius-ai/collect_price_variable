@@ -27,7 +27,6 @@ from src.pipelines.mlops_smoke_test import (
     filter_to_cutoff,
     run_smoke_test,
 )
-from src.tracking.mlflow_utils import load_registry
 
 
 # Fast, leak-safe model subset for the test runs.
@@ -365,7 +364,7 @@ def test_overview_summary_run_attaches_overlay_chart_artifacts(tmp_path):
     recorders, fake_run = _patch_mlflow_run()
 
     with patch("src.pipelines.mlops_smoke_test.maybe_mlflow_run", fake_run):
-        rid = _log_overview_summary_run(results=results, log_to_mlflow=True)
+        _log_overview_summary_run(results=results, log_to_mlflow=True)
 
     assert len(recorders) == 1, "overview must emit exactly one run"
     rec = recorders[0]
@@ -404,7 +403,8 @@ def test_extract_learning_curve_handles_lightgbm_and_non_iterative_models():
     - Models without an epoch concept (Ridge, PersistenceMonthly) →
       returns None. We don't fabricate a curve for them.
     """
-    import numpy as np, pandas as pd
+    import numpy as np
+    import pandas as pd
     from src.pipelines.mlops_smoke_test import _extract_learning_curve
     from src.models.lightgbm_model import LightGBMModel
     from src.models.ridge_model import RidgeModel

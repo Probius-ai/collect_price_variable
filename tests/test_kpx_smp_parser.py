@@ -10,7 +10,6 @@ We patch the source config + a fetched FetchResult to make sure that:
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
 
 import pytest
 

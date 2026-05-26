@@ -1,0 +1,87 @@
+# CI — pytest on push + PR against main.
+#
+# What runs:
+#   * Python 3.11 (Dockerfile target — production parity)
+#   * Python 3.12 (next-version compat check)
+#   * Full requirements.txt (incl. torch / xgboost / lightgbm — same as local)
+#   * pytest -q with coverage report
+#   * Coverage XML uploaded to GitHub Actions summary
+#
+# What does NOT run here (intentional):
+#   * Network-touching tests — none are marked `network` yet, but if added,
+#     the `-m "not network"` filter below skips them.
+#   * MLflow / Postgres integration — the test suite uses ephemeral fixtures
+#     (`tmp_path` + in-memory parsers); no live server needed.
+#
+# Cache strategy: pip cache is keyed on `requirements.txt` hash, so a code-
+# only change reuses the wheel cache and tests start in ~30s instead of ~3min.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual re-run from Actions tab without pushing
+  workflow_dispatch:
+
+# Avoid running multiple identical jobs when commits are pushed quickly.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (python-${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # torch CPU wheel — much smaller (~250 MB) than the default GPU-bundled
+          # one (~2 GB w/ CUDA libs). The project's runtime stack uses CPU too.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Show environment
+        run: |
+          python --version
+          pip list | grep -E "^(pandas|numpy|scikit-learn|lightgbm|xgboost|torch|mlflow|fastapi)"
+
+      - name: Run pytest
+        env:
+          # Disable Discord webhooks in CI (silently no-op via .env unset).
+          MLOPS_DISCORD_WEBHOOK_URL: ""
+          HEALTH_CHECK_DISCORD_WEBHOOK_URL: ""
+          # Force MLflow off — tests don't need a live tracking server.
+          ENABLE_MLFLOW: "false"
+        run: |
+          pytest -q \
+            --cov=src \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml \
+            -m "not network"
+
+      - name: Upload coverage XML
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 7

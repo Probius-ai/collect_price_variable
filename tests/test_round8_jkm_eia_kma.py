@@ -12,10 +12,8 @@ Pins:
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -987,7 +985,6 @@ def test_kma_error_envelopes_dont_collide_within_one_second(tmp_path, monkeypatc
     asserts both files exist on disk with distinct names and the original
     bodies preserved.
     """
-    from src.collectors import kma_mid_temperature as mid_mod
     from src.collectors.kma_mid_temperature import persist_partial_error_envelope
 
     settings = SimpleNamespace(data_dir=tmp_path)

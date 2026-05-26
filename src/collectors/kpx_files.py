@@ -20,7 +20,6 @@ forward-filling each level across merged cells.
 
 from __future__ import annotations
 
-from datetime import datetime, date
 from pathlib import Path
 from typing import Any
 
@@ -343,7 +342,6 @@ def _read_tabular(file_path: Path, config: dict[str, Any]) -> pd.DataFrame:
         else:
             raise FileLoaderError(f"Unsupported file_format={fmt!r} for {file_path}")
 
-        n_header_rows = len(multi_rows)
         # multi_rows are indices *relative to the data after skiprows*
         # but for the round-2 use case they're contiguous from row 0.
         header_block = [raw.iloc[i].tolist() for i in multi_rows]

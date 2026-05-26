@@ -21,7 +21,7 @@ import abc
 import hashlib
 import shutil
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable

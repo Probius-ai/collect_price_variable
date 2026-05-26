@@ -60,3 +60,16 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use compact `m = MagicMock(); m.status_code = 200; ...` for mock
+# setup — more readable than 5 separate lines for trivial attribute
+# assignments.
+"tests/*.py" = ["E702"]
+# Both collectors keep a backward-compat re-export block at the bottom of
+# the file (after a horizontal-rule comment) so older imports keep working
+# while the canonical home is in `src.utils.redact`. The E402 import-order
+# rule fires because the re-export is past line 1; that placement is
+# intentional and load-bearing.
+"src/collectors/kma_mid_temperature.py" = ["E402"]
+"src/collectors/kpx_files.py" = ["E402"]

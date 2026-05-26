@@ -5,9 +5,7 @@ will actually see whatever the collector writes."""
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 
-import pandas as pd
 import pytest
 
 from src.collectors.kpx_smp import KpxSmpCollector

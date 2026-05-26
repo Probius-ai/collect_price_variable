@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -23,10 +22,6 @@ from src.collectors.kpx_files import (
     LngPriceMonthlyFileLoader,
 )
 from src.config.settings import get_source_config
-from src.features.build_monthly import (
-    build_lng_features,
-    load_lng_price_monthly_long,
-)
 from src.models.ar_monthly import MONTHLY_AR_FEATURES
 from src.models.lightgbm_model import DEFAULT_LGB_FEATURES_MONTHLY
 from src.models.ridge_model import DEFAULT_RIDGE_FEATURES_MONTHLY

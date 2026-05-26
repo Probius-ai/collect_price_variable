@@ -67,7 +67,7 @@ def test_ridge_default_pool_excludes_sparse_jkm_daily_columns():
     auto-selected pool. (LightGBM tolerates NaN and gets these via its own
     feature list — different model, different default.)
     """
-    import numpy as np, pandas as pd
+    import numpy as np
     from src.models.ridge_model import RidgeModel, DEFAULT_RIDGE_FEATURES_MONTHLY
 
     sparse_jkm = {
@@ -104,7 +104,7 @@ def test_ridge_pipeline_imputes_nans_when_explicit_features_have_them():
     set that includes a sparse column), the SimpleImputer step in Ridge's
     pipeline imputes the NaN rather than letting sklearn raise.
     """
-    import numpy as np, pandas as pd
+    import numpy as np
     from src.models.ridge_model import RidgeModel
 
     n = 40

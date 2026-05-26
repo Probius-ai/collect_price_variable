@@ -1,0 +1,47 @@
+# CI — ruff lint + format check on push/PR.
+#
+# Lightweight (no project deps installed) — runs in ~15 s. Catches
+# unused imports, undefined names, style drift before they land on main.
+#
+# Configuration lives in `pyproject.toml` ([tool.ruff], line-length=100,
+# target-version=py310). To match CI locally:
+#   pip install ruff
+#   ruff check .
+#   ruff format --check .
+
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff check
+        run: ruff check .
+
+      # Format check is non-blocking initially — flips to required once the
+      # tree is fully formatted. Set `continue-on-error: false` to enforce.
+      - name: ruff format (check only)
+        run: ruff format --check .
+        continue-on-error: true

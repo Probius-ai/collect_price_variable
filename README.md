@@ -1,5 +1,10 @@
 # kpx-price-forecast
 
+[![tests](https://github.com/Probius-ai/collect_price_variable/actions/workflows/test.yml/badge.svg)](https://github.com/Probius-ai/collect_price_variable/actions/workflows/test.yml)
+[![lint](https://github.com/Probius-ai/collect_price_variable/actions/workflows/lint.yml/badge.svg)](https://github.com/Probius-ai/collect_price_variable/actions/workflows/lint.yml)
+[![python](https://img.shields.io/badge/python-3.11_|_3.12-blue.svg)](https://www.python.org/downloads/)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen)](https://github.com/pre-commit/pre-commit)
+
 Korean electricity-market price-variable forecasting (SMP → 정산단가 → REC).
 The repo has two stacks running side-by-side:
 

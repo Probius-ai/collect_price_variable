@@ -503,7 +503,8 @@ def forecast_next_month() -> ForecastResponse:
     selection is justified by the concrete price number the model
     actually produces, not just MAE numbers in the abstract.
     """
-    import pickle, time
+    import pickle
+    import time
 
     version_used, model_name, artifact_dir = _pick_best_v5_artifact()
     pickle_path = artifact_dir / "model.pkl"
